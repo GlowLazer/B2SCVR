@@ -4,7 +4,7 @@ import torch.nn.functional as F
 from sam2.build_sam import build_sam2
 
 class SAM2Extractor (nn.Module):
-    def __init__(self, checkpoint_path="/media/tianyi/BSC-VideoCompletion/B2SCVR/model/modules/sam2/sam2_logs/configs/sam2.1_training/sam2.1_hiera_t_BSCV_lac_atd_dino_50eps.yaml/checkpoints/checkpoint.pt") -> None:
+    def __init__(self, checkpoint_path="/media/ajeet/data/MINI_BTP/B2SCVR/checkpoints/B2SCVR_ckpts/checkpoint.pt") -> None:
     # def __init__(self, checkpoint_path=None):
         super(SAM2Extractor, self).__init__()    
         model_cfg = "configs/sam2.1/sam2.1_hiera_t.yaml"

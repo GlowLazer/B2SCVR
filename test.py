@@ -194,9 +194,7 @@ def main_worker():
     
     print('Saving videos arr...')
     save_dir_name = './outputs'
-    save_base_name = args.video.split('/')[-1]
-    save_ver_name = '_'
-    save_base_name = save_base_name + save_ver_name
+    save_base_name = os.path.basename(args.video.rstrip('/'))
     # print(save_base_name)
     if not os.path.exists(save_dir_name):
         os.makedirs(save_dir_name)
@@ -217,6 +215,6 @@ def main_worker():
         img.save(os.path.join(imwrite_path, f'{i:05d}.jpg'))
     # 30 fps gif
     imgs[0].save(os.path.join(save_path, 'GIF_result.gif'), save_all=True, append_images=imgs[1:], duration=40, loop=0)
-
+    print(f'Saved completed video to: {save_path}')
 if __name__ == '__main__':
     main_worker()
