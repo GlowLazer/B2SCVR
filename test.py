@@ -196,7 +196,8 @@ def process_one_video(model, device, video_path, mask_path, size, framestride):
         fwd = sum_fwd[i] / cnt_fwd[i] if sum_fwd[i] is not None else None
         bwd = sum_bwd[j] / cnt_bwd[j] if sum_bwd[j] is not None else None
         if fwd is not None and bwd is not None:
-            comp_frames.append(((fwd + bwd) / 2).astype(np.uint8))
+            alpha = 0.7
+            comp_frames.append((alpha * fwd + (1 - alpha) * bwd).astype(np.uint8))
         elif fwd is not None:
             comp_frames.append(fwd.astype(np.uint8))
         elif bwd is not None:
