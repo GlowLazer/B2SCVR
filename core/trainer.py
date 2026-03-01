@@ -14,7 +14,7 @@ from torch.utils.tensorboard import SummaryWriter
 
 from core.lr_scheduler import MultiStepRestartLR, CosineAnnealingRestartLR
 from core.loss import AdversarialLoss
-from core.dataset import TrainDataset
+from core.dataset import TrainDataset, DirTrainDataset
 from model.modules.flow_comp import FlowCompletionLoss
 import torch.nn.functional as F
 
@@ -28,7 +28,11 @@ class Trainer:
         self.spynet_lr = config['trainer'].get('spynet_lr', 1.0)
 
         # setup data set and data loader
-        self.train_dataset = TrainDataset(config['train_data_loader'])
+        dl_cfg = config['train_data_loader']
+        if dl_cfg.get('format') == 'dir':
+            self.train_dataset = DirTrainDataset(dl_cfg)
+        else:
+            self.train_dataset = TrainDataset(dl_cfg)
 
         self.train_sampler = None
         self.train_args = config['trainer']
@@ -149,19 +153,21 @@ class Trainer:
                 self.optimG,
                 milestones=scheduler_opt['milestones'],
                 gamma=scheduler_opt['gamma'])
-            self.scheD = MultiStepRestartLR(
-                self.optimD,
-                milestones=scheduler_opt['milestones'],
-                gamma=scheduler_opt['gamma'])
+            if not self.config['model']['no_dis']:
+                self.scheD = MultiStepRestartLR(
+                    self.optimD,
+                    milestones=scheduler_opt['milestones'],
+                    gamma=scheduler_opt['gamma'])
         elif scheduler_type == 'CosineAnnealingRestartLR':
             self.scheG = CosineAnnealingRestartLR(
                 self.optimG,
                 periods=scheduler_opt['periods'],
                 restart_weights=scheduler_opt['restart_weights'])
-            self.scheD = CosineAnnealingRestartLR(
-                self.optimD,
-                periods=scheduler_opt['periods'],
-                restart_weights=scheduler_opt['restart_weights'])
+            if not self.config['model']['no_dis']:
+                self.scheD = CosineAnnealingRestartLR(
+                    self.optimD,
+                    periods=scheduler_opt['periods'],
+                    restart_weights=scheduler_opt['restart_weights'])
         else:
             raise NotImplementedError(
                 f'Scheduler {scheduler_type} is not implemented yet.')
@@ -169,7 +175,8 @@ class Trainer:
     def update_learning_rate(self):
         """Update learning rate."""
         self.scheG.step()
-        self.scheD.step()
+        if not self.config['model']['no_dis']:
+            self.scheD.step()
 
     def get_lr(self):
         """Get current learning rate."""
@@ -226,22 +233,15 @@ class Trainer:
             self.iteration = data_opt['iteration']
 
         else:
-            gen_path = '/path/to/BSCVR/generator.pth'
-            dis_path = '/path/to/BSCVR/discriminator.pth'
-
-            if self.config['global_rank'] == 0:
-                print(f'Loading model from {gen_path}...')
-            dataG = torch.load(gen_path, map_location=self.config['device'])
-            self.netG.load_state_dict(dataG, strict=False)
-            
-            if not self.config['model']['no_dis']:
-                dataD = torch.load(dis_path,
-                                   map_location=self.config['device'])
-                self.netD.load_state_dict(dataD)
-            
-            if self.config['global_rank'] == 0:
-                print('Warnning: There is no trained model found.'
-                      'An initialized model will be used.')
+            gen_path = self.config['model'].get('pretrain', '')
+            if gen_path and os.path.isfile(gen_path):
+                if self.config['global_rank'] == 0:
+                    print(f'Loading pretrain model from {gen_path}...')
+                dataG = torch.load(gen_path, map_location=self.config['device'])
+                self.netG.load_state_dict(dataG, strict=False)
+            else:
+                if self.config['global_rank'] == 0:
+                    print('Warning: No pretrain model found. Using random initialisation.')
 
     def save(self, it):
         """Save parameters every eval_epoch"""
@@ -332,18 +332,19 @@ class Trainer:
             frames, masks, corrupts = frames.to(device), masks.to(device), corrupts.to(device)
             
             # in the first iterations, we freeze the discriminator
-            if self.iteration < 1:
-                for param in self.netD.parameters():
-                    param.requires_grad = False
-            else:
-                for param in self.netD.parameters():
-                    param.requires_grad = True
-                    # re-init the optimizer
-                    self.optimD = torch.optim.Adam(
-                        self.netD.parameters(),
-                        lr=self.config['trainer']['lr'],
-                        betas=(self.config['trainer']['beta1'],
-                            self.config['trainer']['beta2']))
+            if not self.config['model']['no_dis']:
+                if self.iteration < 1:
+                    for param in self.netD.parameters():
+                        param.requires_grad = False
+                else:
+                    for param in self.netD.parameters():
+                        param.requires_grad = True
+                        # re-init the optimizer
+                        self.optimD = torch.optim.Adam(
+                            self.netD.parameters(),
+                            lr=self.config['trainer']['lr'],
+                            betas=(self.config['trainer']['beta1'],
+                                self.config['trainer']['beta2']))
 
             # Training trick 1: if all elements in masks are 0, set the last element to 1
             # This trick is used to avoid the situation that the model prediction is nan, which is caused by the all-zero masks, and it preserves the diffculty in training
@@ -356,7 +357,39 @@ class Trainer:
             pred_imgs, _ = self.netG(frames, corrupts, masks, l_t)
             pred_imgs = pred_imgs.view(b, -1, c, h, w)
             comp_imgs = frames * (1. - masks) + masks * pred_imgs
-            
+
+            # ── Temporal difference loss ──────────────────────────────────────
+            # w_td ramp: 0 for iter<500, linear 0→0.1 for iter 500-2000, 0.1 after
+            it = self.iteration
+            if it < 500:
+                w_td = 0.0
+            elif it < 2000:
+                w_td = 0.1 * (it - 500) / 1500.0
+            else:
+                w_td = 0.1
+
+            if w_td > 0.0 and l_t >= 2:
+                comp_loc   = comp_imgs[:, :l_t]              # (B, l_t, 3, H, W)
+                gt_loc     = frames[:, :l_t]
+                m_loc      = masks[:, :l_t]                  # (B, l_t, 1, H, W)
+
+                d_comp     = comp_loc[:, 1:] - comp_loc[:, :-1]   # (B, l_t-1, 3, H, W)
+                d_gt       = gt_loc[:, 1:]   - gt_loc[:, :-1]
+
+                union      = (m_loc[:, 1:] + m_loc[:, :-1]).clamp(0.0, 1.0)
+                union_flat = union.reshape(b * (l_t - 1), 1, h, w)
+                w_flat     = F.max_pool2d(union_flat, kernel_size=3, stride=1, padding=1)
+                w_mask     = w_flat.reshape(b, l_t - 1, 1, h, w)
+
+                td_err     = (d_comp - d_gt).abs() * w_mask
+                td_loss    = td_err.mean() / (w_mask.mean() + 1e-6)
+                td_loss_item = td_loss.item()
+            else:
+                td_loss      = torch.tensor(0.0).to(device)
+                td_loss_item = 0.0
+
+            mask_ratio = masks[:, :l_t].mean().item()
+
             gen_loss = 0
             dis_loss = 0
 
@@ -396,8 +429,9 @@ class Trainer:
                                     frames * (1 - masks))
             valid_loss = valid_loss_0 / torch.mean(1-masks) \
                 * self.config['losses']['valid_weight']
-            gen_loss += valid_loss            
-            
+            gen_loss += valid_loss
+            gen_loss += w_td * td_loss
+
             # if mask is all-zero, don't change the model weight
             if torch.sum(masks) == 1:
                 pass
@@ -406,16 +440,20 @@ class Trainer:
                 gen_loss.backward()
                 self.optimG.step()
             
-            self.add_summary(self.dis_writer, 'loss/dis_vid_fake',
-                                dis_fake_loss.item())
-            self.add_summary(self.dis_writer, 'loss/dis_vid_real',
-                                dis_real_loss.item())
-            self.add_summary(self.gen_writer, 'loss/gan_loss',
-                                gan_loss.item())
+            if not self.config['model']['no_dis']:
+                self.add_summary(self.dis_writer, 'loss/dis_vid_fake',
+                                    dis_fake_loss.item())
+                self.add_summary(self.dis_writer, 'loss/dis_vid_real',
+                                    dis_real_loss.item())
+                self.add_summary(self.gen_writer, 'loss/gan_loss',
+                                    gan_loss.item())
             self.add_summary(self.gen_writer, 'loss/hole_loss',
                              hole_loss.item())
             self.add_summary(self.gen_writer, 'loss/valid_loss',
                              valid_loss.item())
+            self.add_summary(self.gen_writer, 'loss/td_loss', td_loss_item)
+            self.add_summary(self.gen_writer, 'stat/mask_ratio', mask_ratio)
+            self.add_summary(self.gen_writer, 'stat/w_td', w_td)
             
             self.update_learning_rate()      
             self.iteration += 1
@@ -427,10 +465,12 @@ class Trainer:
                     pbar.set_description((f"d: {dis_loss.item():.3f}; "
                                           f"hole: {hole_loss.item():.3f}; "
                                           f"valid: {valid_loss.item():.3f}; "
+                                          f"td: {td_loss_item:.4f}; "
                                          ))
                 else:
                     pbar.set_description((f"hole: {hole_loss.item():.3f}; "
                                           f"valid: {valid_loss.item():.3f}; "
+                                          f"td: {td_loss_item:.4f}; "
                                          ))
 
                 if self.iteration % self.train_args['log_freq'] == 0:
@@ -438,12 +478,18 @@ class Trainer:
                         logging.info(f"[Iter {self.iteration}] "
                                      f"d: {dis_loss.item():.4f}; "
                                      f"hole: {hole_loss.item():.4f}; "
-                                     f"valid: {valid_loss.item():.4f}"
+                                     f"valid: {valid_loss.item():.4f}; "
+                                     f"td: {td_loss_item:.4f}; "
+                                     f"mask_ratio: {mask_ratio:.3f}; "
+                                     f"w_td: {w_td:.4f}"
                                         )
                     else:
                         logging.info(f"[Iter {self.iteration}] "
                                      f"hole: {hole_loss.item():.4f}; "
-                                     f"valid: {valid_loss.item():.4f}"
+                                     f"valid: {valid_loss.item():.4f}; "
+                                     f"td: {td_loss_item:.4f}; "
+                                     f"mask_ratio: {mask_ratio:.3f}; "
+                                     f"w_td: {w_td:.4f}"
                                      )
 
             # saving models

@@ -299,7 +299,7 @@ os.makedirs(os.path.dirname(args.save) or '.', exist_ok=True)
 # Loss log file sits next to the checkpoint
 loss_log_path = args.save.replace('.pth', '_loss.csv')
 loss_log = open(loss_log_path, 'w')
-loss_log.write('iteration,loss,avg100\n')
+loss_log.write('iteration,band_loss,td_loss,mask_ratio,total_loss,avg100\n')
 loss_log.flush()
 log.info(f'Loss log -> {loss_log_path}')
 
@@ -355,7 +355,7 @@ while iteration < args.iters:
 
     refined, band = bhead(pred_flat, orig_flat, mask_flat)
 
-    # ── Loss: L1 only inside boundary band ───────────────────────────────────
+    # ── Band loss: L1 only inside boundary band ───────────────────────────────
     gt_flat   = gt_local.reshape(b * NUM_LOCAL, c, h, w)
     band_mean = band.mean()
 
@@ -363,7 +363,54 @@ while iteration < args.iters:
     if band_mean < 1e-4:
         continue
 
-    loss = l1(refined * band, gt_flat * band) / band_mean.clamp(min=1e-6)
+    band_loss = l1(refined * band, gt_flat * band) / band_mean.clamp(min=1e-6)
+
+    # ── Temporal difference loss ───────────────────────────────────────────────
+    # w_td ramp: 0 for iter<500, linear 0→0.1 for iter 500-2000, flat 0.1 after
+    if iteration < 500:
+        w_td = 0.0
+    elif iteration < 2000:
+        w_td = 0.1 * (iteration - 500) / 1500.0
+    else:
+        w_td = 0.1
+
+    mask_ratio = masks_local.mean().item()
+
+    if w_td > 0.0 and NUM_LOCAL >= 2:
+        # Reshape flat tensors back to (B, nl, ...) for temporal indexing
+        ref_t  = refined.reshape(b, NUM_LOCAL, c, h, w)   # (B, nl, 3, H, W)
+        msk_t  = masks_local                               # (B, nl, 1, H, W)
+        bsc_t  = bsc_local                                 # (B, nl, 3, H, W)
+        gt_t   = gt_local                                  # (B, nl, 3, H, W)
+
+        # Hard composite: outside mask keep BSC, inside mask use refined
+        comp_ref = bsc_t * (1.0 - msk_t) + ref_t * msk_t   # (B, nl, 3, H, W)
+        # GT is clean — no composite needed
+        comp_gt  = gt_t                                      # (B, nl, 3, H, W)
+
+        # Consecutive pairs
+        comp_prev = comp_ref[:, :-1]   # (B, nl-1, 3, H, W)
+        comp_curr = comp_ref[:, 1:]
+        gt_prev   = comp_gt[:, :-1]
+        gt_curr   = comp_gt[:, 1:]
+        msk_prev  = msk_t[:, :-1]     # (B, nl-1, 1, H, W)
+        msk_curr  = msk_t[:, 1:]
+
+        # W = dilate(M_t OR M_{t-1}), k=3 — only penalise corrupted regions
+        DK = 3
+        merged = (msk_prev + msk_curr).clamp(0.0, 1.0)       # (B, nl-1, 1, H, W)
+        m_flat  = merged.reshape(b * (NUM_LOCAL - 1), 1, h, w)
+        w_mask  = F.max_pool2d(m_flat, kernel_size=DK, stride=1, padding=DK // 2)
+        w_mask  = w_mask.reshape(b, NUM_LOCAL - 1, 1, h, w)
+
+        td_err = (comp_curr - comp_prev - (gt_curr - gt_prev)).abs() * w_mask
+        td_loss = td_err.mean() / w_mask.mean().clamp(min=1e-6)
+        td_loss_item = td_loss.item()
+    else:
+        td_loss      = torch.tensor(0.0, device=device)
+        td_loss_item = 0.0
+
+    loss = band_loss + w_td * td_loss
 
     opt.zero_grad()
     loss.backward()
@@ -378,15 +425,18 @@ while iteration < args.iters:
 
     iteration += 1
     pbar.update(1)
-    pbar.set_postfix(loss=f'{loss_val:.4f}', avg100=f'{avg100:.4f}')
+    pbar.set_postfix(loss=f'{loss_val:.4f}', td=f'{td_loss_item:.4f}', avg100=f'{avg100:.4f}')
 
     # Write to loss CSV every iteration
-    loss_log.write(f'{iteration},{loss_val:.6f},{avg100:.6f}\n')
+    loss_log.write(f'{iteration},{band_loss.item():.6f},{td_loss_item:.6f},'
+                   f'{mask_ratio:.4f},{loss_val:.6f},{avg100:.6f}\n')
     if iteration % 50 == 0:
         loss_log.flush()
 
     if iteration % args.log_freq == 0:
-        log.info(f'[{iteration}/{args.iters}]  loss: {loss_val:.4f}  avg100: {avg100:.4f}')
+        log.info(f'[{iteration}/{args.iters}]  loss: {loss_val:.4f}  '
+                 f'band: {band_loss.item():.4f}  td: {td_loss_item:.4f}  '
+                 f'mask_ratio: {mask_ratio:.3f}  w_td: {w_td:.4f}  avg100: {avg100:.4f}')
 
     if iteration % args.save_freq == 0 or iteration == args.iters:
         iter_path = args.save.replace('.pth', f'_{iteration}.pth')

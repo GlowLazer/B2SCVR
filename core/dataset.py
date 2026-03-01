@@ -1,4 +1,5 @@
 import os
+import glob
 import json
 import random
 
@@ -112,6 +113,83 @@ class TrainDataset(torch.utils.data.Dataset):
         corrupt_tensors = self._to_tensors(corrupts) * 2.0 - 1.0
         mask_tensors = self._to_tensors(masks)
         return frame_tensors, mask_tensors, corrupt_tensors, video_name
+
+
+class DirTrainDataset(torch.utils.data.Dataset):
+    """Dir-format dataset: reads gt/bsc/mask from plain image directories.
+    Returns (frames, masks, corrupts, video_name) matching TrainDataset interface.
+    """
+
+    def __init__(self, args: dict):
+        self.gt_root   = args['gt_root']
+        self.bsc_root  = args['bsc_root']
+        self.mask_root = args['mask_root']
+        self.num_local = args['num_local_frames']
+        self.num_ref   = args['num_ref_frames']
+        self.h, self.w = args['h'], args['w']
+        total_needed   = self.num_local + self.num_ref
+
+        videos = sorted(os.listdir(self.gt_root))
+        self.videos      = []
+        self.frame_count = {}
+        for v in videos:
+            frames = sorted(glob.glob(os.path.join(self.gt_root, v, '*.jpg')) +
+                            glob.glob(os.path.join(self.gt_root, v, '*.png')))
+            if len(frames) >= total_needed + 1:
+                self.videos.append(v)
+                self.frame_count[v] = len(frames)
+
+    def __len__(self):
+        return len(self.videos)
+
+    def __getitem__(self, idx):
+        needed = self.num_local + self.num_ref
+        for _ in range(10):
+            video = self.videos[idx % len(self.videos)]
+            n     = self.frame_count[video]
+
+            pivot     = random.randint(0, n - self.num_local)
+            local_idx = list(range(pivot, pivot + self.num_local))
+            remain    = [i for i in range(n) if i not in set(local_idx)]
+            ref_idx   = sorted(random.sample(remain, self.num_ref))
+            selected  = local_idx + ref_idx
+
+            gt_imgs, bsc_imgs, mask_imgs = [], [], []
+            for i in selected:
+                stem = f'{i:05d}'
+                gt   = cv2.imread(os.path.join(self.gt_root,   video, stem + '.jpg'))
+                bsc  = cv2.imread(os.path.join(self.bsc_root,  video, stem + '.jpg'))
+                mask = cv2.imread(os.path.join(self.mask_root, video, stem + '.png'),
+                                  cv2.IMREAD_GRAYSCALE)
+                if gt is None:
+                    gt = cv2.imread(os.path.join(self.gt_root,  video, stem + '.png'))
+                if bsc is None:
+                    bsc = cv2.imread(os.path.join(self.bsc_root, video, stem + '.png'))
+                if gt is None or bsc is None or mask is None:
+                    continue
+                gt   = cv2.resize(cv2.cvtColor(gt,  cv2.COLOR_BGR2RGB), (self.w, self.h))
+                bsc  = cv2.resize(cv2.cvtColor(bsc, cv2.COLOR_BGR2RGB), (self.w, self.h))
+                mask = cv2.resize(mask, (self.w, self.h), interpolation=cv2.INTER_NEAREST)
+                gt_imgs.append(gt)
+                bsc_imgs.append(bsc)
+                mask_imgs.append(mask)
+
+            local_has_mask = any(mask_imgs[i].max() > 0
+                                 for i in range(min(self.num_local, len(mask_imgs))))
+            if len(gt_imgs) >= needed and local_has_mask:
+                break
+            idx = random.randint(0, len(self.videos) - 1)
+
+        def to_rgb(imgs):
+            arr = np.stack(imgs[:needed], 0).astype(np.float32) / 255.0  # (T,H,W,3)
+            arr = arr.transpose(0, 3, 1, 2)                              # (T,3,H,W)
+            return torch.from_numpy(arr) * 2.0 - 1.0                    # [-1,1]
+
+        def to_mask(imgs):
+            arr = (np.stack(imgs[:needed], 0).astype(np.float32) > 0).astype(np.float32)
+            return torch.from_numpy(arr).unsqueeze(1)                   # (T,1,H,W)
+
+        return to_rgb(gt_imgs), to_mask(mask_imgs), to_rgb(bsc_imgs), video
 
 
 class TestDataset(torch.utils.data.Dataset):
