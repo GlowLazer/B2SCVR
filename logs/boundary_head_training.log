@@ -1,0 +1,10 @@
+nohup: ignoring input
+[02:17:38] Device: cuda
+Traceback (most recent call last):
+  File "/media/ajeet/data/MINI_BTP/B2SCVR/train_boundary.py", line 63, in <module>
+    dataset = TrainDataset(config['train_data_loader'])
+              ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/media/ajeet/data/MINI_BTP/B2SCVR/core/dataset.py", line 25, in __init__
+    json_path = os.path.join(args['data_root'], args['name'], 'train.json')
+                             ~~~~^^^^^^^^^^^^^
+KeyError: 'data_root'

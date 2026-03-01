@@ -29,6 +29,8 @@ parser.add_argument("--neighbor_stride", type=int, default=5)
 parser.add_argument("--framestride", type=int, default=30)
 parser.add_argument("--width", type=int)
 parser.add_argument("--height", type=int)
+parser.add_argument("--boundary_ckpt", type=str, default=None,
+                    help="Optional: path to boundary_head.pth for boundary refinement")
 args = parser.parse_args()
 
 ref_length = args.step  # ref_step
@@ -110,7 +112,7 @@ def soft_boundary_blend(pred, original, binary_mask, blur_ksize=7, dilate_iter=1
             original.astype(np.float32) * (1.0 - soft)).astype(np.uint8)
 
 
-def run_inference_pass(model, device, rframes, rmasks, h, w, framestride):
+def run_inference_pass(model, device, rframes, rmasks, h, w, framestride, boundary_head=None):
     """Run one inference pass; returns per-frame float32 sum and hit count arrays."""
     video_length = len(rframes)
     sum_frames   = [None] * video_length
@@ -159,14 +161,31 @@ def run_inference_pass(model, device, rframes, rmasks, h, w, framestride):
                     4)[:, :, :, :, :w + w_pad]
 
                 pred_imgs, _ = model(selected_imgs, selected_imgs, selected_masks, len(neighbor_ids))
-                pred_imgs = pred_imgs[:, :, :h, :w]
+                pred_imgs = pred_imgs[:, :, :h, :w]   # (N+R, 3, h, w) in [-1,1]
+
+                if boundary_head is not None:
+                    n_nb = len(neighbor_ids)
+                    restored = pred_imgs[:n_nb]                              # (N, 3, h, w)
+                    original = selected_imgs[0, :n_nb, :, :h, :w]          # (N, 3, h, w)
+                    bmask    = selected_masks[0, :n_nb, :, :h, :w]         # (N, 1, h, w)
+                    with torch.no_grad():
+                        refined, _ = boundary_head(restored, original, bmask)
+                    pred_imgs[:n_nb] = refined
+
                 pred_imgs = (pred_imgs + 1) / 2
                 pred_imgs = pred_imgs.cpu().permute(0, 2, 3, 1).numpy() * 255
 
                 for i in range(len(neighbor_ids)):
                     idx  = neighbor_ids[i]
                     gidx = itern * framestride + idx
-                    img  = soft_boundary_blend(pred_imgs[i], frames[idx], binary_masks[idx])
+                    if boundary_head is not None:
+                        # boundary head handles band blending; hard composite
+                        # ensures outside-mask pixels are original BSC exactly
+                        mask2d = binary_masks[idx][:, :, 0:1].astype(np.float32)
+                        img = (pred_imgs[i].astype(np.float32) * mask2d +
+                               frames[idx].astype(np.float32) * (1.0 - mask2d)).astype(np.uint8)
+                    else:
+                        img = soft_boundary_blend(pred_imgs[i], frames[idx], binary_masks[idx])
                     if sum_frames[gidx] is None:
                         sum_frames[gidx] = img.astype(np.float32)
                     else:
@@ -184,11 +203,13 @@ def process_one_video(model, device, video_path, mask_path, size, framestride):
     rmasks = read_mask(mask_path, size)
 
     print('  Forward pass...')
-    sum_fwd, cnt_fwd = run_inference_pass(model, device, rframes, rmasks, h, w, framestride)
+    sum_fwd, cnt_fwd = run_inference_pass(model, device, rframes, rmasks, h, w, framestride,
+                                          boundary_head=process_one_video.boundary_head)
 
     print('  Reverse-time TTA pass...')
     sum_bwd, cnt_bwd = run_inference_pass(
-        model, device, list(reversed(rframes)), list(reversed(rmasks)), h, w, framestride)
+        model, device, list(reversed(rframes)), list(reversed(rmasks)), h, w, framestride,
+        boundary_head=process_one_video.boundary_head)
 
     comp_frames = []
     for i in range(video_length):
@@ -196,7 +217,7 @@ def process_one_video(model, device, video_path, mask_path, size, framestride):
         fwd = sum_fwd[i] / cnt_fwd[i] if sum_fwd[i] is not None else None
         bwd = sum_bwd[j] / cnt_bwd[j] if sum_bwd[j] is not None else None
         if fwd is not None and bwd is not None:
-            alpha = 0.7
+            alpha = 0.5
             comp_frames.append((alpha * fwd + (1 - alpha) * bwd).astype(np.uint8))
         elif fwd is not None:
             comp_frames.append(fwd.astype(np.uint8))
@@ -228,6 +249,16 @@ def main_worker():
     model.load_state_dict(data)
     print(f'Loading model from: {args.ckpt}')
     model.eval()
+
+    # Optionally load boundary refinement head
+    bhead = None
+    if args.boundary_ckpt:
+        from model.boundary_head import BoundaryRefinementHead
+        bhead = BoundaryRefinementHead(channels=64).to(device)
+        bhead.load_state_dict(torch.load(args.boundary_ckpt, map_location=device))
+        bhead.eval()
+        print(f'Loaded boundary head from: {args.boundary_ckpt}')
+    process_one_video.boundary_head = bhead
 
     size = (args.width, args.height)
 

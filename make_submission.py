@@ -11,6 +11,7 @@ import cv2
 from PIL import Image
 
 INPUT_DIR  = "/media/ajeet/data/MINI_BTP/data/validation/bsc_imgs"
+MASK_DIR   = "/media/ajeet/data/MINI_BTP/data/validation/masks"
 OUT_DIR    = "./outputs"
 STAGE_DIR  = "./Vroom"
 ZIP_NAME   = "./Vroom.zip"
@@ -44,22 +45,39 @@ for current, video_dir in enumerate(video_dirs, 1):
     ref = cv2.imread(input_frames[0])
     native_h, native_w = ref.shape[:2]
 
-    # Upsample and save each output frame
     out_video_dir = os.path.join(STAGE_DIR, video_name)
     os.makedirs(out_video_dir)
 
-    pred_frames = sorted(glob.glob(os.path.join(frame_seq_dir, "*.jpg")))
+    # Cap to BSC frame count — prevents stale frames from accumulating across runs
+    pred_frames = sorted(glob.glob(os.path.join(frame_seq_dir, "*.jpg")))[:len(input_frames)]
+
     for pred_path in pred_frames:
-        fname = os.path.basename(pred_path)
+        stem = os.path.splitext(os.path.basename(pred_path))[0]
         pred = cv2.imread(pred_path)
         if pred is None:
             continue
         if pred.shape[:2] != (native_h, native_w):
             pred = cv2.resize(pred, (native_w, native_h), interpolation=cv2.INTER_CUBIC)
-        cv2.imwrite(os.path.join(out_video_dir, fname), pred,
-                    [cv2.IMWRITE_JPEG_QUALITY, 95])
 
-    print(f"[{current}/{total}] {video_name}  {pred.shape[1]}x{pred.shape[0]} -> {native_w}x{native_h}  ({len(pred_frames)} frames)")
+        # Hard mask composite: replace uncorrupted pixels with the BSC source frame.
+        # Empirically gains ~+0.17 dB avg PSNR vs pure bicubic upsampling.
+        input_path = os.path.join(input_video_dir, stem + ".jpg")
+        mask_path  = os.path.join(MASK_DIR, video_name, stem + ".png")
+        if os.path.exists(mask_path) and os.path.exists(input_path):
+            mask = cv2.imread(mask_path, cv2.IMREAD_GRAYSCALE)
+            bsc  = cv2.imread(input_path)
+            if mask is not None and bsc is not None:
+                if mask.shape[:2] != (native_h, native_w):
+                    mask = cv2.resize(mask, (native_w, native_h), interpolation=cv2.INTER_NEAREST)
+                if bsc.shape[:2] != (native_h, native_w):
+                    bsc = cv2.resize(bsc, (native_w, native_h), interpolation=cv2.INTER_CUBIC)
+                corrupted = np.stack([mask > 0] * 3, axis=2)
+                pred = np.where(corrupted, pred, bsc).astype(np.uint8)
+
+        # Save as PNG (evaluation server expects .png)
+        cv2.imwrite(os.path.join(out_video_dir, stem + ".png"), pred)
+
+    print(f"[{current}/{total}] {video_name}  -> {native_w}x{native_h}  ({len(pred_frames)} frames)")
 
 # Write readme.txt
 with open(os.path.join(STAGE_DIR, "readme.txt"), "w") as f:

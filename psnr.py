@@ -22,7 +22,8 @@ for current, frame_seq_dir in enumerate(video_dirs, 1):
         print(f"[{current}/{total}] SKIP {video_name}  (no GT at {gt_dir})")
         continue
 
-    pred_files = sorted(glob.glob(os.path.join(frame_seq_dir, "*.jpg")))
+    pred_files = sorted(glob.glob(os.path.join(frame_seq_dir, "*.jpg")) +
+                        glob.glob(os.path.join(frame_seq_dir, "*.png")))
     if not pred_files:
         print(f"[{current}/{total}] SKIP {video_name}  (no frames)")
         continue
@@ -40,8 +41,14 @@ for current, frame_seq_dir in enumerate(video_dirs, 1):
                 skip_mask += 1
                 continue
 
-        gt_path = os.path.join(gt_dir, os.path.basename(pred_path))
-        if not os.path.exists(gt_path):
+        # GT files may be .jpg or .png regardless of pred extension
+        gt_path = None
+        for ext in ('.jpg', '.png'):
+            candidate = os.path.join(gt_dir, stem + ext)
+            if os.path.exists(candidate):
+                gt_path = candidate
+                break
+        if gt_path is None:
             skip_gt += 1
             continue
 
@@ -50,6 +57,12 @@ for current, frame_seq_dir in enumerate(video_dirs, 1):
         if pred_bgr is None or gt_bgr is None:
             skip_read += 1
             continue
+                                                                                            
+        # Upsample pred to GT resolution if they differ (e.g. 432x240 -> 1280x720)
+        if pred_bgr.shape[:2] != gt_bgr.shape[:2]:
+            pred_bgr = cv2.resize(pred_bgr,
+                                  (gt_bgr.shape[1], gt_bgr.shape[0]),
+                                  interpolation=cv2.INTER_CUBIC)
 
         pred = cv2.cvtColor(pred_bgr, cv2.COLOR_BGR2RGB).astype(np.float64)
         gt   = cv2.cvtColor(gt_bgr,   cv2.COLOR_BGR2RGB).astype(np.float64)
