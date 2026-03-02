@@ -106,9 +106,11 @@ class TrainDataset(torch.utils.data.Dataset):
             masks.append(mask)
             corrupts.append(corr_img)
 
-        # normalizate, to tensors
-        frames = GroupRandomHorizontalFlip()(frames)
-        corrupts = GroupRandomHorizontalFlip()(corrupts)
+        # normalizate, to tensors — apply ONE shared flip to keep gt/bsc/mask aligned
+        if random.random() < 0.5:
+            frames   = [f.transpose(Image.FLIP_LEFT_RIGHT) for f in frames]
+            corrupts = [c.transpose(Image.FLIP_LEFT_RIGHT) for c in corrupts]
+            masks    = [m.transpose(Image.FLIP_LEFT_RIGHT) for m in masks]
         frame_tensors = self._to_tensors(frames) * 2.0 - 1.0
         corrupt_tensors = self._to_tensors(corrupts) * 2.0 - 1.0
         mask_tensors = self._to_tensors(masks)
@@ -121,13 +123,14 @@ class DirTrainDataset(torch.utils.data.Dataset):
     """
 
     def __init__(self, args: dict):
-        self.gt_root   = args['gt_root']
-        self.bsc_root  = args['bsc_root']
-        self.mask_root = args['mask_root']
-        self.num_local = args['num_local_frames']
-        self.num_ref   = args['num_ref_frames']
-        self.h, self.w = args['h'], args['w']
-        total_needed   = self.num_local + self.num_ref
+        self.gt_root       = args['gt_root']
+        self.bsc_root      = args['bsc_root']
+        self.mask_root     = args['mask_root']
+        self.num_local     = args['num_local_frames']
+        self.num_ref       = args['num_ref_frames']
+        self.h, self.w     = args['h'], args['w']
+        self.min_mask_ratio = args.get('min_mask_ratio', 0.0)
+        total_needed       = self.num_local + self.num_ref
 
         videos = sorted(os.listdir(self.gt_root))
         self.videos      = []
@@ -174,11 +177,25 @@ class DirTrainDataset(torch.utils.data.Dataset):
                 bsc_imgs.append(bsc)
                 mask_imgs.append(mask)
 
-            local_has_mask = any(mask_imgs[i].max() > 0
-                                 for i in range(min(self.num_local, len(mask_imgs))))
-            if len(gt_imgs) >= needed and local_has_mask:
+            n_local = min(self.num_local, len(mask_imgs))
+            local_has_mask = any(mask_imgs[i].max() > 0 for i in range(n_local))
+            local_mask_ratio = (sum(mask_imgs[i].mean() for i in range(n_local))
+                                / (n_local * 255.0)) if n_local > 0 else 0.0
+            passes_ratio = (self.min_mask_ratio == 0.0
+                            or local_mask_ratio >= self.min_mask_ratio)
+            if len(gt_imgs) >= needed and local_has_mask and passes_ratio:
                 break
             idx = random.randint(0, len(self.videos) - 1)
+        else:
+            # 10 retries exhausted without meeting filter; hard-resample a new index
+            if not (len(gt_imgs) >= needed and local_has_mask and passes_ratio):
+                return self.__getitem__(random.randint(0, len(self.videos) - 1))
+
+        # shared horizontal flip — keeps gt/bsc/mask aligned
+        if random.random() < 0.5:
+            gt_imgs   = [np.ascontiguousarray(img[:, ::-1, :]) for img in gt_imgs]
+            bsc_imgs  = [np.ascontiguousarray(img[:, ::-1, :]) for img in bsc_imgs]
+            mask_imgs = [np.ascontiguousarray(img[:, ::-1])    for img in mask_imgs]
 
         def to_rgb(imgs):
             arr = np.stack(imgs[:needed], 0).astype(np.float32) / 255.0  # (T,H,W,3)

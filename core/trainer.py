@@ -2,8 +2,13 @@ import os
 import glob
 import logging
 import importlib
+import re
 import numpy as np
 from tqdm import tqdm
+
+import cv2
+from PIL import Image
+from skimage.metrics import structural_similarity as ssim_func
 
 import torch
 import torch.nn as nn
@@ -15,6 +20,7 @@ from torch.utils.tensorboard import SummaryWriter
 from core.lr_scheduler import MultiStepRestartLR, CosineAnnealingRestartLR
 from core.loss import AdversarialLoss
 from core.dataset import TrainDataset, DirTrainDataset
+from core.utils import to_tensors
 from model.modules.flow_comp import FlowCompletionLoss
 import torch.nn.functional as F
 
@@ -26,6 +32,7 @@ class Trainer:
         self.num_local_frames = config['train_data_loader']['num_local_frames']
         self.num_ref_frames = config['train_data_loader']['num_ref_frames']
         self.spynet_lr = config['trainer'].get('spynet_lr', 1.0)
+        self.empty_mask_skip_count = 0
 
         # setup data set and data loader
         dl_cfg = config['train_data_loader']
@@ -36,6 +43,7 @@ class Trainer:
 
         self.train_sampler = None
         self.train_args = config['trainer']
+        self.train_args.setdefault('save_freq', 500)
         if config['distributed']:
             self.train_sampler = DistributedSampler(
                 self.train_dataset,
@@ -88,6 +96,17 @@ class Trainer:
         for param in self.netG.parameters():
             param.data = param.data.contiguous()
 
+        self.use_ema = bool(self.train_args.get('use_ema', True))
+        self.ema_decay = float(self.train_args.get('ema_decay', 0.999))
+        self.cons_every = int(self.config['losses'].get('cons_every', 0))
+        self.cons_weight = float(self.config['losses'].get('cons_weight', 0.0))
+        self.ema_state = {}
+        if self.use_ema:
+            netG_ref = self.netG.module if isinstance(self.netG, (nn.DataParallel, DDP)) else self.netG
+            for name, param in netG_ref.named_parameters():
+                if param.requires_grad:
+                    self.ema_state[name] = param.detach().clone()
+
         # set summary writer
         self.dis_writer = None
         self.gen_writer = None
@@ -97,6 +116,32 @@ class Trainer:
                 os.path.join(config['save_dir'], 'dis'))
             self.gen_writer = SummaryWriter(
                 os.path.join(config['save_dir'], 'gen'))
+
+        # ── inline val-eval setup ─────────────────────────────────────────────
+        self.best_psnr = -1.0
+        val_cfg = config.get('val_data', {})
+        self.val_video_dir = val_cfg.get('video_dir', '')
+        self.val_mask_dir  = val_cfg.get('mask_dir',  '')
+        self.val_gt_dir    = val_cfg.get('gt_dir',    '')
+        self.val_w = config['train_data_loader'].get('w', 432)
+        self.val_h = config['train_data_loader'].get('h', 240)
+        self.val_enabled = bool(
+            self.val_video_dir
+            and os.path.isdir(self.val_video_dir)
+            and os.path.isdir(self.val_mask_dir)
+            and os.path.isdir(self.val_gt_dir))
+        self.val_csv_path = os.path.join(config['save_dir'], 'val_psnr.csv')
+        if self.val_enabled and not os.path.isfile(self.val_csv_path):
+            with open(self.val_csv_path, 'w') as f:
+                f.write('iteration,mean_psnr\n')
+        # Resume best_psnr from a previous run if available
+        best_txt = os.path.join(config['save_dir'], 'best.txt')
+        if os.path.isfile(best_txt):
+            try:
+                self.best_psnr = float(
+                    open(best_txt).read().strip().split('psnr=')[1])
+            except Exception:
+                pass
 
     def setup_optimizers(self):
         """Set up optimizers."""
@@ -133,6 +178,7 @@ class Trainer:
         ]
 
         self.optimG = torch.optim.Adam(optim_params,
+                                       weight_decay=self.config['trainer'].get('weight_decay', 1e-4),
                                        betas=(self.config['trainer']['beta1'],
                                               self.config['trainer']['beta2']))
 
@@ -190,6 +236,69 @@ class Trainer:
         if writer is not None and self.iteration % 100 == 0:
             writer.add_scalar(name, self.summary[name] / 100, self.iteration)
             self.summary[name] = 0
+
+    def _update_ema(self):
+        if not self.use_ema:
+            return
+        netG_ref = self.netG.module if isinstance(self.netG, (nn.DataParallel, DDP)) else self.netG
+        with torch.no_grad():
+            for name, param in netG_ref.named_parameters():
+                if not param.requires_grad or name not in self.ema_state:
+                    continue
+                self.ema_state[name].mul_(self.ema_decay).add_(
+                    param.detach(), alpha=1.0 - self.ema_decay)
+
+    def _build_ema_state_dict(self, netG_ref):
+        ema_dict = {k: v.detach().clone() for k, v in netG_ref.state_dict().items()}
+        for name, tensor in self.ema_state.items():
+            if name in ema_dict:
+                ema_dict[name] = tensor.detach().to(
+                    device=ema_dict[name].device, dtype=ema_dict[name].dtype).clone()
+        return ema_dict
+
+    def _swap_in_ema(self, netG_ref):
+        if not self.use_ema:
+            return {}
+        backup = {}
+        with torch.no_grad():
+            for name, param in netG_ref.named_parameters():
+                if not param.requires_grad or name not in self.ema_state:
+                    continue
+                backup[name] = param.data.detach().clone()
+                param.data.copy_(self.ema_state[name].to(device=param.device, dtype=param.dtype))
+        return backup
+
+    def _restore_from_backup(self, netG_ref, backup):
+        if not backup:
+            return
+        with torch.no_grad():
+            for name, param in netG_ref.named_parameters():
+                if name in backup:
+                    param.data.copy_(backup[name].to(device=param.device, dtype=param.dtype))
+
+    def _cleanup_old_checkpoints(self):
+        keep_last_k = int(self.train_args.get('keep_last_k', 0))
+        if keep_last_k <= 0:
+            return
+        save_dir = self.config['save_dir']
+        ids = []
+        for p in glob.glob(os.path.join(save_dir, 'gen_*.pth')):
+            m = re.match(r'^gen_(\d{6})\.pth$', os.path.basename(p))
+            if m:
+                ids.append(int(m.group(1)))
+        ids = sorted(set(ids))
+        if len(ids) <= keep_last_k:
+            return
+        for old_id in ids[:-keep_last_k]:
+            for name in (
+                f'gen_{old_id:06d}.pth',
+                f'gen_{old_id:06d}_ema.pth',
+                f'opt_{old_id:06d}.pth',
+                f'dis_{old_id:06d}.pth',
+            ):
+                path = os.path.join(save_dir, name)
+                if os.path.isfile(path):
+                    os.remove(path)
 
     def load(self):
         """Load netG (and netD)."""
@@ -249,6 +358,8 @@ class Trainer:
             # configure path
             gen_path = os.path.join(self.config['save_dir'],
                                     f'gen_{it:06d}.pth')
+            gen_ema_path = os.path.join(self.config['save_dir'],
+                                        f'gen_{it:06d}_ema.pth')
             dis_path = os.path.join(self.config['save_dir'],
                                     f'dis_{it:06d}.pth')
             opt_path = os.path.join(self.config['save_dir'],
@@ -268,6 +379,8 @@ class Trainer:
 
             # save checkpoints
             torch.save(netG.state_dict(), gen_path)
+            if self.use_ema and self.ema_state:
+                torch.save(self._build_ema_state_dict(netG), gen_ema_path)
             if not self.config['model']['no_dis']:
                 torch.save(netD.state_dict(), dis_path)
                 torch.save(
@@ -290,6 +403,174 @@ class Trainer:
 
             latest_path = os.path.join(self.config['save_dir'], 'latest.ckpt')
             os.system(f"echo {it:06d} > {latest_path}")
+            self._cleanup_old_checkpoints()
+
+    def _val_quick(self, it):
+        """
+        Forward-only (no TTA, no boundary head) PSNR eval on val_video_dir.
+        Saves gen_best.pth if PSNR improves. Appends to val_psnr.csv.
+        Called on rank-0 only, right after self.save().
+        """
+        if not self.val_enabled:
+            return
+
+        device = self.config['device']
+        w, h   = self.val_w, self.val_h
+        NEIGHBOR_STRIDE = 5
+        REF_STEP        = 10
+        FRAMESTRIDE     = 30
+
+        netG = self.netG.module if isinstance(self.netG, (nn.DataParallel, DDP)) else self.netG
+        ema_backup = self._swap_in_ema(netG)
+        netG.eval()
+
+        videos = sorted([d for d in os.listdir(self.val_video_dir)
+                         if os.path.isdir(os.path.join(self.val_video_dir, d))])
+        all_psnrs = []
+
+        for video in videos:
+            vpath = os.path.join(self.val_video_dir, video)
+            mpath = os.path.join(self.val_mask_dir,  video)
+            gpath = os.path.join(self.val_gt_dir,    video)
+            if not os.path.isdir(mpath) or not os.path.isdir(gpath):
+                continue
+
+            # Read BSC frames
+            rframes = []
+            for name in sorted(os.listdir(vpath)):
+                img = cv2.imread(os.path.join(vpath, name))
+                if img is None:
+                    continue
+                img = Image.fromarray(cv2.cvtColor(img, cv2.COLOR_BGR2RGB)).resize((w, h))
+                rframes.append(img)
+            if not rframes:
+                continue
+
+            # Read masks (same pre-processing as test.py)
+            rmasks = []
+            for mp in sorted(os.listdir(mpath)):
+                m = Image.open(os.path.join(mpath, mp)).resize((w, h), Image.NEAREST)
+                m = np.array(m.convert('L'))
+                m = np.array(m > 0).astype(np.uint8)
+                m = cv2.dilate(m, cv2.getStructuringElement(cv2.MORPH_CROSS, (3, 3)),
+                               iterations=4)
+                rmasks.append(Image.fromarray(m * 255))
+
+            video_length = len(rframes)
+            sum_frames   = [None] * video_length
+            count_frames = [0]    * video_length
+
+            x_frames = [rframes[i:i + FRAMESTRIDE] for i in range(0, video_length, FRAMESTRIDE)]
+            x_masks  = [rmasks[i:i + FRAMESTRIDE]  for i in range(0, video_length, FRAMESTRIDE)]
+
+            for itern in range(len(x_frames)):
+                stride_length = len(x_frames[itern])
+                imgs  = to_tensors()(x_frames[itern]).unsqueeze(0) * 2 - 1
+                raw_f = [np.array(f).astype(np.uint8) for f in x_frames[itern]]
+                bmasks = [
+                    np.expand_dims((np.array(m) != 0).astype(np.uint8), 2)
+                    for m in x_masks[itern]
+                ]
+                masks = to_tensors()(x_masks[itern]).unsqueeze(0)
+                imgs, masks = imgs.to(device), masks.to(device)
+
+                for f in range(0, stride_length, NEIGHBOR_STRIDE):
+                    neighbor_ids = [i for i in range(
+                        max(0, f - NEIGHBOR_STRIDE),
+                        min(stride_length, f + NEIGHBOR_STRIDE + 1))]
+                    ref_ids = [i for i in range(0, stride_length, REF_STEP)
+                               if i not in neighbor_ids]
+                    sel_imgs  = imgs[:1, neighbor_ids + ref_ids]
+                    sel_masks = masks[:1, neighbor_ids + ref_ids]
+
+                    with torch.no_grad():
+                        pred_out, _ = netG(sel_imgs, sel_imgs, sel_masks, len(neighbor_ids))
+                        pred_out = pred_out[:, :, :h, :w]
+                        pred_out = (pred_out + 1) / 2
+                        pred_np  = pred_out.cpu().permute(0, 2, 3, 1).numpy() * 255
+
+                    for i, idx in enumerate(neighbor_ids):
+                        gidx   = itern * FRAMESTRIDE + idx
+                        mask2d = bmasks[idx][:, :, 0:1].astype(np.float32)
+                        img    = (pred_np[i].astype(np.float32) * mask2d +
+                                  raw_f[idx].astype(np.float32) * (1.0 - mask2d)).astype(np.uint8)
+                        if sum_frames[gidx] is None:
+                            sum_frames[gidx] = img.astype(np.float32)
+                        else:
+                            sum_frames[gidx] += img.astype(np.float32)
+                        count_frames[gidx] += 1
+
+            # Compute PSNR on corrupted frames only
+            vid_psnrs = []
+            for i, frame in enumerate(sum_frames):
+                if frame is None:
+                    continue
+                comp = (frame / count_frames[i]).astype(np.uint8)
+
+                mask_path = os.path.join(mpath, f'{i:05d}.png')
+                if os.path.exists(mask_path):
+                    mask_raw = cv2.imread(mask_path, cv2.IMREAD_GRAYSCALE)
+                    if mask_raw is None or not np.any(mask_raw > 0):
+                        continue
+
+                gt_path = None
+                for ext in ('.jpg', '.png'):
+                    cand = os.path.join(gpath, f'{i:05d}{ext}')
+                    if os.path.exists(cand):
+                        gt_path = cand
+                        break
+                if gt_path is None:
+                    continue
+
+                gt_bgr = cv2.imread(gt_path)
+                if gt_bgr is None:
+                    continue
+
+                pred_bgr = cv2.cvtColor(comp, cv2.COLOR_RGB2BGR)
+                if pred_bgr.shape[:2] != gt_bgr.shape[:2]:
+                    pred_bgr = cv2.resize(pred_bgr,
+                                          (gt_bgr.shape[1], gt_bgr.shape[0]),
+                                          interpolation=cv2.INTER_CUBIC)
+                pred_f = cv2.cvtColor(pred_bgr, cv2.COLOR_BGR2RGB).astype(np.float64)
+                gt_f   = cv2.cvtColor(gt_bgr,   cv2.COLOR_BGR2RGB).astype(np.float64)
+                mse    = np.mean((pred_f - gt_f) ** 2)
+                psnr   = 20.0 * np.log10(255.0 / np.sqrt(mse)) if mse > 0 else float('inf')
+                vid_psnrs.append(psnr)
+
+            if vid_psnrs:
+                all_psnrs.append(float(np.mean(vid_psnrs)))
+
+        self._restore_from_backup(netG, ema_backup)
+        netG.train()
+
+        if not all_psnrs:
+            return
+
+        mean_psnr = float(np.mean(all_psnrs))
+
+        # CSV log
+        with open(self.val_csv_path, 'a') as f:
+            f.write(f'{it},{mean_psnr:.4f}\n')
+
+        # Tensorboard
+        if self.gen_writer is not None:
+            self.gen_writer.add_scalar('val/psnr', mean_psnr, it)
+
+        # Save gen_best.pth if improved
+        is_best = mean_psnr > self.best_psnr + 1e-4
+        if is_best:
+            self.best_psnr = mean_psnr
+            best_path = os.path.join(self.config['save_dir'], 'gen_best.pth')
+            if self.use_ema and self.ema_state:
+                torch.save(self._build_ema_state_dict(netG), best_path)
+            else:
+                torch.save(netG.state_dict(), best_path)
+            with open(os.path.join(self.config['save_dir'], 'best.txt'), 'w') as f:
+                f.write(f'iter={it}  psnr={mean_psnr:.4f}\n')
+
+        marker = '  ← NEW BEST' if is_best else ''
+        print(f'\n[Val @ {it}] mean PSNR: {mean_psnr:.4f} dB  '
+              f'(best: {self.best_psnr:.4f} dB){marker}')
 
     def train(self):
         """training entry"""
@@ -346,27 +627,31 @@ class Trainer:
                             betas=(self.config['trainer']['beta1'],
                                 self.config['trainer']['beta2']))
 
-            # Training trick 1: if all elements in masks are 0, set the last element to 1
-            # This trick is used to avoid the situation that the model prediction is nan, which is caused by the all-zero masks, and it preserves the diffculty in training
-            if torch.sum(masks) == 0:
-                masks[:, 0, ...] = 1
+            # Skip truly empty-mask batches and track how often this occurs.
+            if masks.sum() < 1.0:
+                self.empty_mask_skip_count += 1
+                if self.config['global_rank'] == 0 and self.empty_mask_skip_count % 50 == 0:
+                    logging.info(f"[EmptyMaskSkip] count={self.empty_mask_skip_count}")
+                continue
             
             l_t = self.num_local_frames
             b, t, c, h, w = frames.size()
             
             pred_imgs, _ = self.netG(frames, corrupts, masks, l_t)
             pred_imgs = pred_imgs.view(b, -1, c, h, w)
-            comp_imgs = frames * (1. - masks) + masks * pred_imgs
+            comp_imgs = corrupts * (1. - masks) + masks * pred_imgs
 
             # ── Temporal difference loss ──────────────────────────────────────
-            # w_td ramp: 0 for iter<500, linear 0→0.1 for iter 500-2000, 0.1 after
+            # w_td ramp: 0 for iter<500, linear 0→td_max for iter 500-2000, td_max after
+            # Set losses.td_weight: 0.0 in config to disable TD entirely (e.g. specialist)
+            td_max = self.config['losses'].get('td_weight', 0.1)
             it = self.iteration
-            if it < 500:
+            if td_max == 0.0 or it < 500:
                 w_td = 0.0
             elif it < 2000:
-                w_td = 0.1 * (it - 500) / 1500.0
+                w_td = td_max * (it - 500) / 1500.0
             else:
-                w_td = 0.1
+                w_td = td_max
 
             if w_td > 0.0 and l_t >= 2:
                 comp_loc   = comp_imgs[:, :l_t]              # (B, l_t, 3, H, W)
@@ -419,11 +704,11 @@ class Trainer:
                         * self.config['losses']['adversarial_weight']
                     gen_loss += gan_loss
 
-            # generator l1 loss
+            # generator l1 hole loss
             hole_loss_0 = self.l1_loss(pred_imgs * masks, frames * masks)
             hole_loss = hole_loss_0 / torch.mean(masks) \
-                * self.config['losses']['hole_weight']            
-            gen_loss += hole_loss 
+                * self.config['losses']['hole_weight']
+            gen_loss += hole_loss
 
             valid_loss_0 = self.l1_loss(pred_imgs * (1 - masks),
                                     frames * (1 - masks))
@@ -432,13 +717,29 @@ class Trainer:
             gen_loss += valid_loss
             gen_loss += w_td * td_loss
 
-            # if mask is all-zero, don't change the model weight
-            if torch.sum(masks) == 1:
-                pass
-            else:
-                self.optimG.zero_grad()
-                gen_loss.backward()
-                self.optimG.step()
+            # EMA-consistency regularizer: L1(pred - pred_ema) inside local masks.
+            cons_ema_loss = torch.tensor(0.0, device=device)
+            if (self.use_ema and self.ema_state and self.cons_weight > 0.0
+                    and self.cons_every > 0 and self.iteration % self.cons_every == 0):
+                netG_ref = self.netG.module if isinstance(self.netG, (nn.DataParallel, DDP)) else self.netG
+                ema_backup = self._swap_in_ema(netG_ref)
+                with torch.no_grad():
+                    pred_ema, _ = netG_ref(frames, corrupts, masks, l_t)
+                    pred_ema = pred_ema.view(b, -1, c, h, w)[:, :l_t]
+                self._restore_from_backup(netG_ref, ema_backup)
+
+                pred_loc = pred_imgs[:, :l_t]
+                pred_ema_loc = pred_ema
+                mask_loc = masks[:, :l_t]
+                cons_l1 = (pred_loc - pred_ema_loc).abs() * mask_loc
+                cons_l1 = cons_l1.mean() / (mask_loc.mean() + 1e-6)
+                cons_ema_loss = self.cons_weight * cons_l1
+                gen_loss += cons_ema_loss
+
+            self.optimG.zero_grad()
+            gen_loss.backward()
+            self.optimG.step()
+            self._update_ema()
             
             if not self.config['model']['no_dis']:
                 self.add_summary(self.dis_writer, 'loss/dis_vid_fake',
@@ -452,6 +753,8 @@ class Trainer:
             self.add_summary(self.gen_writer, 'loss/valid_loss',
                              valid_loss.item())
             self.add_summary(self.gen_writer, 'loss/td_loss', td_loss_item)
+            self.add_summary(self.gen_writer, 'loss/cons_ema',
+                             cons_ema_loss.item())
             self.add_summary(self.gen_writer, 'stat/mask_ratio', mask_ratio)
             self.add_summary(self.gen_writer, 'stat/w_td', w_td)
             
@@ -466,11 +769,13 @@ class Trainer:
                                           f"hole: {hole_loss.item():.3f}; "
                                           f"valid: {valid_loss.item():.3f}; "
                                           f"td: {td_loss_item:.4f}; "
+                                          f"mask: {mask_ratio:.3f}"
                                          ))
                 else:
                     pbar.set_description((f"hole: {hole_loss.item():.3f}; "
                                           f"valid: {valid_loss.item():.3f}; "
                                           f"td: {td_loss_item:.4f}; "
+                                          f"mask: {mask_ratio:.3f}"
                                          ))
 
                 if self.iteration % self.train_args['log_freq'] == 0:
@@ -492,9 +797,11 @@ class Trainer:
                                      f"w_td: {w_td:.4f}"
                                      )
 
-            # saving models
+            # saving models + inline val eval
             if self.iteration % self.train_args['save_freq'] == 0:
                 self.save(int(self.iteration))
+                if self.config['global_rank'] == 0:
+                    self._val_quick(int(self.iteration))
 
             if self.iteration > self.train_args['iterations']:
                 break

@@ -1,0 +1,52 @@
+{
+  "save_dir": "checkpoints/ema_cons_run1",
+  "model": {
+    "net": "b2scvr_hq",
+    "no_dis": true,
+    "pretrain": "checkpoints/main_best.pth"
+  },
+  "trainer": {
+    "iterations": 10000,
+    "batch_size": 1,
+    "num_workers": 4,
+    "lr": 2e-6,
+    "beta1": 0.9,
+    "beta2": 0.999,
+    "weight_decay": 1e-4,
+    "spynet_lr": 1.0,
+    "save_freq": 500,
+    "log_freq": 50,
+    "use_ema": true,
+    "ema_decay": 0.999,
+    "keep_last_k": 6,
+    "scheduler": {
+      "type": "MultiStepRestartLR",
+      "milestones": [4000, 8000],
+      "gamma": 0.5
+    }
+  },
+  "losses": {
+    "GAN_LOSS": "hinge",
+    "adversarial_weight": 0.0,
+    "hole_weight": 1.0,
+    "valid_weight": 0.0,
+    "td_weight": 0.0,
+    "cons_every": 4,
+    "cons_weight": 0.05
+  },
+  "val_data": {
+    "video_dir": "worst10/bsc_imgs",
+    "mask_dir": "worst10/masks",
+    "gt_dir": "worst10/gt_imgs"
+  },
+  "train_data_loader": {
+    "format": "dir",
+    "gt_root": "/home/ajeet/MINIP/data/train/train_gt_imgs",
+    "bsc_root": "/home/ajeet/MINIP/data/train/train_bsc_imgs",
+    "mask_root": "/home/ajeet/MINIP/data/train/train_masks",
+    "num_local_frames": 5,
+    "num_ref_frames": 3,
+    "w": 432,
+    "h": 240
+  }
+}

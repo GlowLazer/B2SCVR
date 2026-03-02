@@ -1,8 +1,11 @@
 __pycache__
 __pycache__/*
+*/__pycache__/*/*
 Vroom
 outputs
 Vroom.zip
 checkpoints/B2SCVR_ckpts
 checkpoints/
 temp_alpha/
+worst10
+core/__pycache__/*

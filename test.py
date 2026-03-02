@@ -112,8 +112,13 @@ def soft_boundary_blend(pred, original, binary_mask, blur_ksize=7, dilate_iter=1
             original.astype(np.float32) * (1.0 - soft)).astype(np.uint8)
 
 
-def run_inference_pass(model, device, rframes, rmasks, h, w, framestride, boundary_head=None):
-    """Run one inference pass; returns per-frame float32 sum and hit count arrays."""
+def run_inference_pass(model, device, rframes, rmasks, h, w, framestride,
+                       boundary_head=None, target_indices=None):
+    """Run one inference pass; returns per-frame float32 sum and hit count arrays.
+
+    target_indices: optional set of global frame indices to accumulate results for.
+    If None, all frames are accumulated (default behaviour).
+    """
     video_length = len(rframes)
     sum_frames   = [None] * video_length
     count_frames = [0]    * video_length
@@ -137,29 +142,16 @@ def run_inference_pass(model, device, rframes, rmasks, h, w, framestride, bounda
                 i for i in range(max(0, f - neighbor_stride),
                                  min(stride_length, f + neighbor_stride + 1))
             ]
+            # skip this window if none of its neighbors are target frames
+            if target_indices is not None:
+                global_ids = {itern * framestride + i for i in neighbor_ids}
+                if not global_ids.intersection(target_indices):
+                    continue
+
             ref_ids = get_ref_index(f, neighbor_ids, stride_length)
             selected_imgs  = imgs[:1, neighbor_ids + ref_ids, :, :, :]
             selected_masks = masks[:1, neighbor_ids + ref_ids, :, :, :]
             with torch.no_grad():
-                masked_imgs        = selected_imgs * (1 - selected_masks)
-                corrupted_contents = selected_imgs * selected_masks
-                mod_size_h, mod_size_w = 60, 108
-                h_pad = (mod_size_h - h % mod_size_h) % mod_size_h
-                w_pad = (mod_size_w - w % mod_size_w) % mod_size_w
-
-                masked_imgs = torch.cat(
-                    [masked_imgs, torch.flip(masked_imgs, [3])],
-                    3)[:, :, :, :h + h_pad, :]
-                masked_imgs = torch.cat(
-                    [masked_imgs, torch.flip(masked_imgs, [4])],
-                    4)[:, :, :, :, :w + w_pad]
-                corrupted_contents = torch.cat(
-                    [corrupted_contents, torch.flip(corrupted_contents, [3])],
-                    3)[:, :, :, :h + h_pad, :]
-                corrupted_contents = torch.cat(
-                    [corrupted_contents, torch.flip(corrupted_contents, [4])],
-                    4)[:, :, :, :, :w + w_pad]
-
                 pred_imgs, _ = model(selected_imgs, selected_imgs, selected_masks, len(neighbor_ids))
                 pred_imgs = pred_imgs[:, :, :h, :w]   # (N+R, 3, h, w) in [-1,1]
 
@@ -178,6 +170,8 @@ def run_inference_pass(model, device, rframes, rmasks, h, w, framestride, bounda
                 for i in range(len(neighbor_ids)):
                     idx  = neighbor_ids[i]
                     gidx = itern * framestride + idx
+                    if target_indices is not None and gidx not in target_indices:
+                        continue
                     if boundary_head is not None:
                         # boundary head handles band blending; hard composite
                         # ensures outside-mask pixels are original BSC exactly
@@ -195,6 +189,24 @@ def run_inference_pass(model, device, rframes, rmasks, h, w, framestride, bounda
     return sum_frames, count_frames
 
 
+def _tta_merge(sum_fwd, cnt_fwd, sum_bwd, cnt_bwd, video_length):
+    """Merge forward and reverse-TTA passes into final float32 frames."""
+    frames = []
+    for i in range(video_length):
+        j   = video_length - 1 - i
+        fwd = (sum_fwd[i] / cnt_fwd[i]) if (sum_fwd[i] is not None and cnt_fwd[i] > 0) else None
+        bwd = (sum_bwd[j] / cnt_bwd[j]) if (sum_bwd[j] is not None and cnt_bwd[j] > 0) else None
+        if fwd is not None and bwd is not None:
+            frames.append((0.5 * fwd + 0.5 * bwd).astype(np.uint8))
+        elif fwd is not None:
+            frames.append(fwd.astype(np.uint8))
+        elif bwd is not None:
+            frames.append(bwd.astype(np.uint8))
+        else:
+            frames.append(None)
+    return frames
+
+
 def process_one_video(model, device, video_path, mask_path, size, framestride):
     rframes = read_frame_from_videos(video_path)
     rframes, size = resize_frames(rframes, size)
@@ -202,41 +214,31 @@ def process_one_video(model, device, video_path, mask_path, size, framestride):
     video_length = len(rframes)
     rmasks = read_mask(mask_path, size)
 
-    print('  Forward pass...')
-    sum_fwd, cnt_fwd = run_inference_pass(model, device, rframes, rmasks, h, w, framestride,
-                                          boundary_head=process_one_video.boundary_head)
+    bhead = process_one_video.boundary_head
 
-    print('  Reverse-time TTA pass...')
+    print('  Forward pass (main)...')
+    sum_fwd, cnt_fwd = run_inference_pass(model, device, rframes, rmasks, h, w, framestride,
+                                          boundary_head=bhead)
+    print('  Reverse-time TTA pass (main)...')
     sum_bwd, cnt_bwd = run_inference_pass(
         model, device, list(reversed(rframes)), list(reversed(rmasks)), h, w, framestride,
-        boundary_head=process_one_video.boundary_head)
-
-    comp_frames = []
-    for i in range(video_length):
-        j   = video_length - 1 - i
-        fwd = sum_fwd[i] / cnt_fwd[i] if sum_fwd[i] is not None else None
-        bwd = sum_bwd[j] / cnt_bwd[j] if sum_bwd[j] is not None else None
-        if fwd is not None and bwd is not None:
-            alpha = 0.5
-            comp_frames.append((alpha * fwd + (1 - alpha) * bwd).astype(np.uint8))
-        elif fwd is not None:
-            comp_frames.append(fwd.astype(np.uint8))
-        elif bwd is not None:
-            comp_frames.append(bwd.astype(np.uint8))
-        else:
-            comp_frames.append(None)
+        boundary_head=bhead)
+    comp_frames = _tta_merge(sum_fwd, cnt_fwd, sum_bwd, cnt_bwd, video_length)
 
     save_base_name = os.path.basename(video_path.rstrip('/'))
     save_path   = os.path.join('./outputs', save_base_name)
     imwrite_path = os.path.join(save_path, 'frame_seq')
     os.makedirs(imwrite_path, exist_ok=True)
-    new_comp_frames = [f for f in comp_frames if f is not None]
-    imgs = [Image.fromarray(f) for f in new_comp_frames]
-    for i, img in enumerate(imgs):
-        img.save(os.path.join(imwrite_path, f'{i:05d}.jpg'))
-    imgs[0].save(os.path.join(save_path, 'GIF_result.gif'),
-                 save_all=True, append_images=imgs[1:], duration=40, loop=0)
-    print(f'  Saved {len(imgs)} frames to: {save_path}')
+    saved = 0
+    for i, f in enumerate(comp_frames):
+        if f is None:
+            continue
+        Image.fromarray(f).save(os.path.join(imwrite_path, f'{i:05d}.jpg'))
+        saved += 1
+    gif_imgs = [Image.fromarray(f) for f in comp_frames if f is not None]
+    gif_imgs[0].save(os.path.join(save_path, 'GIF_result.gif'),
+                     save_all=True, append_images=gif_imgs[1:], duration=40, loop=0)
+    print(f'  Saved {saved} frames to: {save_path}')
 
 
 def main_worker():
@@ -260,7 +262,7 @@ def main_worker():
         print(f'Loaded boundary head from: {args.boundary_ckpt}')
     process_one_video.boundary_head = bhead
 
-    size = (args.width, args.height)
+    size = (args.width, args.height) if (args.width is not None and args.height is not None) else None
 
     if args.video_dir:
         # Batch mode: loop over all video subdirs, model stays loaded
