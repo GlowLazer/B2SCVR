@@ -1,8 +1,24 @@
+# ── PyTorch (install separately before this file) ──────────────────────────
+# conda install pytorch==2.5.1 torchvision==0.20.1 torchaudio==2.5.1 pytorch-cuda=12.1 -c pytorch -c nvidia
+# OR:
+# pip install torch==2.5.1 torchvision==0.20.1 torchaudio==2.5.1 --index-url https://download.pytorch.org/whl/cu121
+
+# ── mmcv (install before this file) ────────────────────────────────────────
+# pip install mmcv==2.2.0 -f https://download.openmmlab.com/mmcv/dist/cu121/torch2.4/index.html
+
+# ── SAM2 (bundled in repo, install before this file) ───────────────────────
+# cd model/modules/sam2 && pip install -e . && cd ../../..
+
+# ── Python requirements ─────────────────────────────────────────────────────
+mmengine==0.10.7
+basicsr==1.4.2
+timm==1.0.25
+fairscale==0.4.13
+open-clip-torch==3.2.0
+lpips==0.1.4
+scikit-image==0.25.2
+opencv-python==4.13.0.92
+numpy==2.2.6
+Pillow==12.0.0
 tqdm
-scikit_image
-lpips
-timm
-basicsr
-fairscale
-open-clip-torch
 motion-vector-extractor

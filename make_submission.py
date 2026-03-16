@@ -14,11 +14,15 @@ from PIL import Image
 ap = argparse.ArgumentParser()
 ap.add_argument('--input_dir', default='./outputs',
                 help='Directory containing per-video output subdirs (default: ./outputs)')
+ap.add_argument('--bsc_dir', required=True,
+                help='Path to BSC input frames root (e.g. /data/ntire_test/bsc_imgs)')
+ap.add_argument('--mask_dir', required=True,
+                help='Path to masks root (e.g. /data/ntire_test/masks)')
 ap.add_argument('--zip_name',  default='./Vroom.zip')
 _args = ap.parse_args()
 
-INPUT_DIR  = "/media/ajeet/data/MINI_BTP/data/ntire_test_set_25/bsc_imgs"
-MASK_DIR   = "/media/ajeet/data/MINI_BTP/data/ntire_test_set_25/masks"
+INPUT_DIR  = _args.bsc_dir
+MASK_DIR   = _args.mask_dir
 OUT_DIR    = _args.input_dir
 STAGE_DIR  = "./Vroom"
 ZIP_NAME   = _args.zip_name

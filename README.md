@@ -1,93 +1,142 @@
-<div align="center">
+# Enhanced B2SCVR — NTIRE 2026 BSCVR Challenge (Team Vroom)
 
-   <h1>[ACM MM'25] Towards Blind Bitstream-corrupted Video Recovery: A Visual Foundation Model-driven Framework </h1>
+This repository contains Team Vroom's submission for the
+NTIRE 2026 Challenge on Bitstream-corrupted Video Restoration (BSCVR).
 
-> [Tianyi Liu](https://scholar.google.com/citations?user=Sdw8w_YAAAAJ&hl=zh-CN)<sup>1</sup>, [Kejun Wu](https://kejun-wu.github.io/)<sup>2</sup>, [Chen Cai](https://scholar.google.com/citations?user=awQEstcAAAAJ&hl=zh-CN)<sup>1</sup>, [Yi Wang](https://scholar.google.com/citations?user=MAG909MAAAAJ&hl=zh-CN)<sup>3</sup>, [Kim-Hui Yap](https://scholar.google.com/citations?user=nr86m98AAAAJ&hl=zh-CN)<sup>1</sup>, and [Lap-Pui Chau](https://scholar.google.com/citations?user=MYREIH0AAAAJ&hl=zh-CN)<sup>3</sup><br>
-> <sup>1</sup>School of Electrical and Electronic Engineering, Nanyang Technological University<br>
-> <sup>2</sup>School of Electronic Information and Communications, Huazhong University of Science and Technology<br>
-> <sup>3</sup>Department of Electrical and Electronic Engineering, The Hong Kong Polytechnic University
+Built upon the [B2SCVR baseline](https://github.com/LIUTIGHE/B2SCVR) with the
+following enhancements:
+- SAM2 Hiera-T feature extractor with LoRA fine-tuning
+- Boundary Refinement Head for mask-boundary artefact correction
+- Residual Refiner (lightweight U-Net, ~768K params) for per-frame correction
+- Reverse TTA (bidirectional temporal ensemble with learned Spatial Alpha Net)
+- MSE-only fine-tuning with tuned hole/valid loss weights
 
-<p align="center">
-    <a href='https://arxiv.org/abs/2507.22481'>
-      <img src='https://img.shields.io/badge/Paper-arXiv-green?style=plastic&logo=arXiv&logoColor=green' alt='Paper arXiv'>
-    </a>
-</p>
-
-</div>
+---
 
 ## Installation
 
+**Requirements:** Python 3.10, CUDA 12.1
+
 ```bash
-git clone https://github.com/LIUTIGHE/B2SCVR.git
+git clone <this-repo>
+cd B2SCVR
+
+# 1. Create conda environment
 conda create -n b2scvr python=3.10
 conda activate b2scvr
 
-# build mmcv first according to the official documents (can ignore the torch mismatch)
+# 2. Install PyTorch (CUDA 12.1)
+conda install pytorch==2.5.1 torchvision==0.20.1 torchaudio==2.5.1 pytorch-cuda=12.1 -c pytorch -c nvidia
+
+# 3. Install mmcv
 pip install mmcv==2.2.0 -f https://download.openmmlab.com/mmcv/dist/cu121/torch2.4/index.html
 
-# install torch according to the official documents
-conda install pytorch==2.5.1 torchvision==0.20.1 torchaudio==2.5.1 pytorch-cuda=12.1 -c pytorch -c nvidia  
-
-# install DAC developed based on SAM2.1
-cd ../model/modules/sam2
+# 4. Install SAM2 (bundled)
+cd model/modules/sam2
 pip install -e .
-
-# other requirements
 cd ../../..
-pip install -r requirements.txt
 
+# 5. Install remaining dependencies
+pip install -r requirements.txt
 ```
 
-- If intel MKL lib issue occurs, can reinstall torch with ```pip install torch==2.5.1 torchvision==0.20.1 torchaudio==2.5.1 --index-url https://download.pytorch.org/whl/cu121```
+**Known issues:**
+- If `ModuleNotFoundError: torchvision.transforms.functional_tensor` occurs, edit
+  the reported `degradations.py` line:
+  change `from torchvision.transforms.functional_tensor import rgb_to_grayscale`
+  to `from torchvision.transforms.functional import rgb_to_grayscale`
+- If Intel MKL errors occur, reinstall torch via pip:
+  `pip install torch==2.5.1 torchvision==0.20.1 --index-url https://download.pytorch.org/whl/cu121`
+- For mmcv-related errors, replace `mmcv.cnn` → `mmengine.model` and
+  `mmcv.runner` → `mmengine.runner` in the reported file.
 
-- If ```ModuleNotFoundError: No module named 'torchvision.transforms.functional_tensor``` occurs, one possible solution is to manually modify the 8th row in ```degradations.py``` mentioned in the Error, from ``` from torchvision.transforms.functional_tensor import rgb_to_grayscale ``` to ``` from torchvision.transforms.functional import rgb_to_grayscale ```
+---
 
-- If you meet mmcv-related error, please modify the reported line ```mmcv.cnn -> mmengine.model``` / ```mmcv.runner -> mmengine.runner```.
+## Checkpoints
 
-## Quick Trianing / Minimum Re-implementation for NTIRE BSCVR Challenge
+Place the following checkpoints in the `checkpoints/` directory:
+
+| File | Description |
+|------|-------------|
+| `checkpoints/psnr_run5/gen_best.pth` | Main inpainting model (submitted) |
+| `checkpoints/boundary_head_best.pth` | Boundary Refinement Head |
+| `checkpoints/refiner_1500_best.pth` | Residual Refiner |
+| `checkpoints/lora_sam2_run3_best.pth` | SAM2 LoRA + SAMFuser weights |
+| `checkpoints/lora_transformer_on_sam2_best.pth` | Transformer LoRA weights |
+| `checkpoints/B2SCVR_ckpts/checkpoint.pt` | SAM2.1 Hiera-T backbone |
+
+---
+
+## Inference
 
 ```bash
-   python train.py --c config/train_bscvr_hq_moe_challenge.json
+bash vali.sh \
+  --video_dir /path/to/bsc_imgs \
+  --mask_dir  /path/to/masks
 ```
 
-## Quick Test
+Output frames are saved to `outputs/<video_name>/frame_seq/`.
 
-0. Prepare inputs and model checkpoints: a corrupted video bitstream and the first corruption indication (e.g., the first corruption mask in frame 9 of ```inputs/trucks-race_2.h264```). Then download the model checkpoints via [this link](https://entuedu-my.sharepoint.com/:f:/g/personal/liut0038_e_ntu_edu_sg/EvxHRdWSFpZIhyiqHU-NYmEBGy5N1iJ4I69iigYtL7FBkw?e=GpPNnL), and put them into ```checkpoints/``` folder.
-   
-1. Extract the corrupted frames and motion vector (mv) and prediction mode (pm) for each frame from the input corrupted video bitstream (e.g., ```inputs/trucks-race_2.h264```)
-   ```bash
-   python inputs.py --input inputs/trucks-race_2.h264
-   ```
+Optional flags:
+- `--out_dir ./outputs` — output directory (default: `./outputs`)
+- `--width 432 --height 240` — inference resolution (default)
 
-3. Stage 1: Use DAC to detect and localize video corruption:
-   ```bash
-   cd model/modules/sam2
-   bash run.sh  # if there is a loading error, mostly related to vos_inference.py line 277-278, which sets a fixed suffix
-   ``` 
+---
 
-3. Stage 2: Use the CFC-based recovery model to perform restoration
-   ```bash
-   cd ../../..
-   python test.py --ckpt checkpoints/B2SCVR.pth --input_video inputs/bsc_imgs/trucks-race --dac_mask inputs/results/trucks-race --width 432 --height 240  # set 240P test if OOM occurs
-   ```
+## Package Submission (CodaBench)
 
-4. The recovered frames sequence and GIF video will be saved in ```outputs/``` folder.
+After inference, run:
 
-## Citation
-
-If you find the code useful, please kindly consider citing our paper
-
+```bash
+python make_submission.py \
+  --bsc_dir  /path/to/bsc_imgs \
+  --mask_dir /path/to/masks \
+  --input_dir outputs \
+  --zip_name Vroom.zip
 ```
-@article{liu2025towards,
-  title={Towards Blind Bitstream-corrupted Video Recovery via a Visual Foundation Model-driven Framework},
-  author={Liu, Tianyi and Wu, Kejun and Cai, Chen and Wang, Yi and Yap, Kim-Hui and Chau, Lap-Pui},
-  journal={arXiv preprint arXiv:2507.22481},
-  year={2025}
-}
+
+This upsamples outputs to native resolution, applies a hard-mask composite
+(+~0.17 dB PSNR), and packages everything as `Vroom.zip` for CodaBench submission.
+
+---
+
+## Training
+
+To reproduce the submitted checkpoint (`psnr_run5`):
+
+```bash
+# 1. Train base model
+python train.py --c config/ema_cons_run1.json
+
+# 2. Fine-tune with PSNR-optimized loss weights
+python train.py --c config/config_psnr.json
+
+# 3. Train LoRA adapters
+python train_lora_sam2.py --c config/lora_sam2.json
+python train_lora_transformer.py
+
+# 4. Train Residual Refiner
+bash gen_train_preds_1500.sh   # generate training predictions
+python train_refiner.py
+
+# 5. Train Boundary Head
+python train_boundary.py
 ```
+
+---
+
+## Results (Validation — worst10 set, 432x240)
+
+| Configuration | PSNR (dB) | SSIM |
+|---|---|---|
+| Baseline (`main_best.pth`) | 18.24 | — |
+| + MSE weight tuning (`psnr_run5`) | 20.23 | 0.747 |
+| + Residual Refiner (full pipeline) | 22.73 | 0.791 |
+
+---
 
 ## Acknowledgements
 
-This work is built upon [BSCV](https://github.com/LIUTIGHE/BSCV-Dataset), [SAM-2](https://github.com/facebookresearch/sam2), and [ATD](https://github.com/LabShuHangGU/Adaptive-Token-Dictionary).
-
-
+Built upon [B2SCVR](https://github.com/LIUTIGHE/B2SCVR),
+[SAM2](https://github.com/facebookresearch/sam2), and
+[ATD](https://github.com/LabShuHangGU/Adaptive-Token-Dictionary).
