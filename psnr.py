@@ -1,12 +1,20 @@
 import os
 import glob
+import argparse
 import numpy as np
 import cv2
 from skimage.metrics import structural_similarity as ssim_func
 
-GT_DIR   = "/media/ajeet/data/MINI_BTP/data/validation/gt_imgs"
-MASK_DIR = "/media/ajeet/data/MINI_BTP/data/validation/masks"
-OUT_DIR  = "./Vroom"
+p = argparse.ArgumentParser()
+p.add_argument('--input_dir', default='./Vroom',
+               help='Directory of per-video subdirs to evaluate (default: ./Vroom)')
+p.add_argument('--gt_dir',   default='/media/ajeet/data/MINI_BTP/data/validation/gt_imgs')
+p.add_argument('--mask_dir', default='/media/ajeet/data/MINI_BTP/data/validation/masks')
+args = p.parse_args()
+
+GT_DIR   = args.gt_dir
+MASK_DIR = args.mask_dir
+OUT_DIR  = args.input_dir
 
 video_dirs = sorted([d for d in glob.glob(os.path.join(OUT_DIR, "*")) if os.path.isdir(d)])
 total = len(video_dirs)
@@ -22,8 +30,15 @@ for current, frame_seq_dir in enumerate(video_dirs, 1):
         print(f"[{current}/{total}] SKIP {video_name}  (no GT at {gt_dir})")
         continue
 
-    pred_files = sorted(glob.glob(os.path.join(frame_seq_dir, "*.jpg")) +
-                        glob.glob(os.path.join(frame_seq_dir, "*.png")))
+    # Support both Vroom layout (<video>/*.png) and raw outputs layout (<video>/frame_seq/*.png)
+    search_dir = frame_seq_dir
+    if not glob.glob(os.path.join(search_dir, "*.jpg")) and \
+       not glob.glob(os.path.join(search_dir, "*.png")):
+        candidate = os.path.join(search_dir, "frame_seq")
+        if os.path.isdir(candidate):
+            search_dir = candidate
+    pred_files = sorted(glob.glob(os.path.join(search_dir, "*.jpg")) +
+                        glob.glob(os.path.join(search_dir, "*.png")))
     if not pred_files:
         print(f"[{current}/{total}] SKIP {video_name}  (no frames)")
         continue
