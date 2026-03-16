@@ -1,0 +1,22 @@
+{
+    "save_dir": "checkpoints/lora_sam2",
+    "model": {
+        "net": "b2scvr_hq",
+        "no_dis": true
+    },
+    "lora": {
+        "rank": 8,
+        "alpha": 16
+    },
+    "train_data_loader": {
+        "format": "dir",
+        "gt_root":   "/home/ajeet/MINIP/data/train/train_gt_imgs",
+        "bsc_root":  "/home/ajeet/MINIP/data/train/train_bsc_imgs",
+        "mask_root": "/home/ajeet/MINIP/data/train/train_masks",
+        "num_local_frames": 5,
+        "num_ref_frames": 3,
+        "w": 432,
+        "h": 240,
+        "min_mask_ratio": 0.12
+    }
+}
