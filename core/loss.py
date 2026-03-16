@@ -7,10 +7,7 @@ class AdversarialLoss(nn.Module):
     Adversarial loss
     https://arxiv.org/abs/1711.10337
     """
-    def __init__(self,
-                 type='nsgan',
-                 target_real_label=1.0,
-                 target_fake_label=0.0):
+    def __init__(self,type='nsgan',target_real_label=1.0,target_fake_label=0.0):
         r"""
         type = nsgan | lsgan | hinge
         """

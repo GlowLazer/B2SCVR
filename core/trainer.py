@@ -3,6 +3,7 @@ import glob
 import logging
 import importlib
 import re
+import csv
 import numpy as np
 from tqdm import tqdm
 
@@ -16,6 +17,7 @@ from torch.utils.data import DataLoader
 from torch.utils.data.distributed import DistributedSampler
 from torch.nn.parallel import DistributedDataParallel as DDP
 from torch.utils.tensorboard import SummaryWriter
+from torch.cuda.amp import autocast, GradScaler
 
 from core.lr_scheduler import MultiStepRestartLR, CosineAnnealingRestartLR
 from core.loss import AdversarialLoss
@@ -98,14 +100,18 @@ class Trainer:
 
         self.use_ema = bool(self.train_args.get('use_ema', True))
         self.ema_decay = float(self.train_args.get('ema_decay', 0.999))
-        self.cons_every = int(self.config['losses'].get('cons_every', 0))
-        self.cons_weight = float(self.config['losses'].get('cons_weight', 0.0))
         self.ema_state = {}
         if self.use_ema:
             netG_ref = self.netG.module if isinstance(self.netG, (nn.DataParallel, DDP)) else self.netG
             for name, param in netG_ref.named_parameters():
                 if param.requires_grad:
                     self.ema_state[name] = param.detach().clone()
+
+        # ── mixed precision (optional) ───────────────────────────────────────
+        device = self.config.get('device', None)
+        device_type = getattr(device, "type", str(device))
+        self.use_amp = bool(self.train_args.get('use_amp', False)) and (device_type == 'cuda')
+        self.scaler = GradScaler(enabled=self.use_amp)
 
         # set summary writer
         self.dis_writer = None
@@ -133,7 +139,7 @@ class Trainer:
         self.val_csv_path = os.path.join(config['save_dir'], 'val_psnr.csv')
         if self.val_enabled and not os.path.isfile(self.val_csv_path):
             with open(self.val_csv_path, 'w') as f:
-                f.write('iteration,mean_psnr\n')
+                f.write('iteration,mean_psnr,mean_ssim\n')
         # Resume best_psnr from a previous run if available
         best_txt = os.path.join(config['save_dir'], 'best.txt')
         if os.path.isfile(best_txt):
@@ -142,6 +148,19 @@ class Trainer:
                     open(best_txt).read().strip().split('psnr=')[1])
             except Exception:
                 pass
+
+        # ── train loss CSV ──────────────────────────────────────────────────
+        self.train_csv_path = os.path.join(config['save_dir'], 'train_losses.csv')
+        os.makedirs(config['save_dir'], exist_ok=True)
+        if not os.path.isfile(self.train_csv_path):
+            with open(self.train_csv_path, 'w', newline='') as f:
+                w = csv.writer(f)
+                w.writerow([
+                    'iteration', 'lr',
+                    'hole_loss', 'valid_loss', 'l1_stab', 'td_loss', 'gan_loss',
+                    'total_gen', 'total_dis',
+                    'mask_ratio', 'w_td', 'w_l1', 'w_gan',
+                ])
 
     def setup_optimizers(self):
         """Set up optimizers."""
@@ -308,12 +327,16 @@ class Trainer:
             latest_epoch = open(os.path.join(model_path, 'latest.ckpt'),
                                 'r').read().splitlines()[-1]
         else:
-            ckpts = [
-                os.path.basename(i).split('.pth')[0]
-                for i in glob.glob(os.path.join(model_path, '*.pth'))
-            ]
-            ckpts.sort()
-            latest_epoch = ckpts[-1] if len(ckpts) > 0 else None
+            ckpts = sorted(glob.glob(os.path.join(model_path, 'gen_[0-9]*.pth')))
+            # strip _ema suffix and extract iteration number
+            iters = []
+            for c in ckpts:
+                base = os.path.basename(c).replace('_ema', '').split('.pth')[0]
+                try:
+                    iters.append(int(base.replace('gen_', '')))
+                except ValueError:
+                    pass
+            latest_epoch = str(max(iters)) if iters else None
 
         if latest_epoch is not None:
             gen_path = os.path.join(model_path,
@@ -416,9 +439,22 @@ class Trainer:
 
         device = self.config['device']
         w, h   = self.val_w, self.val_h
-        NEIGHBOR_STRIDE = 5
-        REF_STEP        = 10
-        FRAMESTRIDE     = 30
+        val_cfg = self.config.get('val_data', {})
+        use_train_frame_counts = bool(val_cfg.get('use_train_frame_counts', True))
+        val_use_amp = bool(val_cfg.get('use_amp', self.use_amp)) and getattr(device, "type", str(device)) == 'cuda'
+
+        # Keep val-time memory bounded by matching the frame counts used in training by default.
+        # The previous sliding-window settings could use many more frames per forward pass,
+        # which is much more memory-hungry (especially for attention/softmax).
+        NEIGHBOR_STRIDE = int(val_cfg.get('neighbor_stride', 5))
+        REF_STEP        = int(val_cfg.get('ref_step', 10))
+        FRAMESTRIDE     = int(val_cfg.get('frame_stride', 30))
+        if use_train_frame_counts:
+            VAL_LOCAL_FRAMES = int(val_cfg.get('num_local_frames', self.num_local_frames))
+            VAL_REF_FRAMES   = int(val_cfg.get('num_ref_frames', self.num_ref_frames))
+
+        if getattr(device, "type", str(device)) == 'cuda':
+            torch.cuda.empty_cache()
 
         netG = self.netG.module if isinstance(self.netG, (nn.DataParallel, DDP)) else self.netG
         ema_backup = self._swap_in_ema(netG)
@@ -427,89 +463,114 @@ class Trainer:
         videos = sorted([d for d in os.listdir(self.val_video_dir)
                          if os.path.isdir(os.path.join(self.val_video_dir, d))])
         all_psnrs = []
+        all_ssims = []
 
-        for video in videos:
-            vpath = os.path.join(self.val_video_dir, video)
-            mpath = os.path.join(self.val_mask_dir,  video)
-            gpath = os.path.join(self.val_gt_dir,    video)
-            if not os.path.isdir(mpath) or not os.path.isdir(gpath):
-                continue
-
-            # Read BSC frames
-            rframes = []
-            for name in sorted(os.listdir(vpath)):
-                img = cv2.imread(os.path.join(vpath, name))
-                if img is None:
+        with torch.inference_mode():
+            for video in videos:
+                vpath = os.path.join(self.val_video_dir, video)
+                mpath = os.path.join(self.val_mask_dir,  video)
+                gpath = os.path.join(self.val_gt_dir,    video)
+                if not os.path.isdir(mpath) or not os.path.isdir(gpath):
                     continue
-                img = Image.fromarray(cv2.cvtColor(img, cv2.COLOR_BGR2RGB)).resize((w, h))
-                rframes.append(img)
-            if not rframes:
-                continue
 
-            # Read masks (same pre-processing as test.py)
-            rmasks = []
-            for mp in sorted(os.listdir(mpath)):
-                m = Image.open(os.path.join(mpath, mp)).resize((w, h), Image.NEAREST)
-                m = np.array(m.convert('L'))
-                m = np.array(m > 0).astype(np.uint8)
-                m = cv2.dilate(m, cv2.getStructuringElement(cv2.MORPH_CROSS, (3, 3)),
-                               iterations=4)
-                rmasks.append(Image.fromarray(m * 255))
+                # Read BSC frames
+                rframes = []
+                for name in sorted(os.listdir(vpath)):
+                    img = cv2.imread(os.path.join(vpath, name))
+                    if img is None:
+                        continue
+                    img = Image.fromarray(cv2.cvtColor(img, cv2.COLOR_BGR2RGB)).resize((w, h))
+                    rframes.append(img)
+                if not rframes:
+                    continue
 
-            video_length = len(rframes)
-            sum_frames   = [None] * video_length
-            count_frames = [0]    * video_length
+                # Read masks (same pre-processing as test.py)
+                rmasks = []
+                for mp in sorted(os.listdir(mpath)):
+                    m = Image.open(os.path.join(mpath, mp)).resize((w, h), Image.NEAREST)
+                    m = np.array(m.convert('L'))
+                    m = np.array(m > 0).astype(np.uint8)
+                    m = cv2.dilate(m, cv2.getStructuringElement(cv2.MORPH_CROSS, (3, 3)),
+                                   iterations=4)
+                    rmasks.append(Image.fromarray(m * 255))
+                if not rmasks:
+                    continue
 
-            x_frames = [rframes[i:i + FRAMESTRIDE] for i in range(0, video_length, FRAMESTRIDE)]
-            x_masks  = [rmasks[i:i + FRAMESTRIDE]  for i in range(0, video_length, FRAMESTRIDE)]
+                video_length = len(rframes)
+                sum_frames   = [None] * video_length
+                count_frames = [0]    * video_length
 
-            for itern in range(len(x_frames)):
-                stride_length = len(x_frames[itern])
-                imgs  = to_tensors()(x_frames[itern]).unsqueeze(0) * 2 - 1
-                raw_f = [np.array(f).astype(np.uint8) for f in x_frames[itern]]
-                bmasks = [
-                    np.expand_dims((np.array(m) != 0).astype(np.uint8), 2)
-                    for m in x_masks[itern]
-                ]
-                masks = to_tensors()(x_masks[itern]).unsqueeze(0)
-                imgs, masks = imgs.to(device), masks.to(device)
+                x_frames = [rframes[i:i + FRAMESTRIDE] for i in range(0, video_length, FRAMESTRIDE)]
+                x_masks  = [rmasks[i:i + FRAMESTRIDE]  for i in range(0, video_length, FRAMESTRIDE)]
 
-                for f in range(0, stride_length, NEIGHBOR_STRIDE):
-                    neighbor_ids = [i for i in range(
-                        max(0, f - NEIGHBOR_STRIDE),
-                        min(stride_length, f + NEIGHBOR_STRIDE + 1))]
-                    ref_ids = [i for i in range(0, stride_length, REF_STEP)
-                               if i not in neighbor_ids]
-                    sel_imgs  = imgs[:1, neighbor_ids + ref_ids]
-                    sel_masks = masks[:1, neighbor_ids + ref_ids]
+                for itern in range(len(x_frames)):
+                    stride_length = len(x_frames[itern])
+                    imgs  = to_tensors()(x_frames[itern]).unsqueeze(0) * 2 - 1
+                    raw_f = [np.array(f).astype(np.uint8) for f in x_frames[itern]]
+                    bmasks = [
+                        np.expand_dims((np.array(m) != 0).astype(np.uint8), 2)
+                        for m in x_masks[itern]
+                    ]
+                    masks = to_tensors()(x_masks[itern]).unsqueeze(0)
+                    imgs, masks = imgs.to(device), masks.to(device)
 
-                    with torch.no_grad():
-                        pred_out, _ = netG(sel_imgs, sel_imgs, sel_masks, len(neighbor_ids))
-                        pred_out = pred_out[:, :, :h, :w]
-                        pred_out = (pred_out + 1) / 2
-                        pred_np  = pred_out.cpu().permute(0, 2, 3, 1).numpy() * 255
+                    for f in range(0, stride_length, NEIGHBOR_STRIDE):
+                        if use_train_frame_counts:
+                            local_n = min(VAL_LOCAL_FRAMES, stride_length)
+                            half = local_n // 2
+                            start = max(0, min(f - half, stride_length - local_n))
+                            neighbor_ids = list(range(start, start + local_n))
 
-                    for i, idx in enumerate(neighbor_ids):
-                        gidx   = itern * FRAMESTRIDE + idx
-                        mask2d = bmasks[idx][:, :, 0:1].astype(np.float32)
-                        img    = (pred_np[i].astype(np.float32) * mask2d +
-                                  raw_f[idx].astype(np.float32) * (1.0 - mask2d)).astype(np.uint8)
-                        if sum_frames[gidx] is None:
-                            sum_frames[gidx] = img.astype(np.float32)
+                            ref_candidates = [i for i in range(0, stride_length, max(1, REF_STEP))
+                                              if i not in neighbor_ids]
+                            if len(ref_candidates) < VAL_REF_FRAMES:
+                                ref_candidates += [i for i in range(stride_length) if i not in neighbor_ids]
+                            ref_ids = ref_candidates[:VAL_REF_FRAMES]
                         else:
-                            sum_frames[gidx] += img.astype(np.float32)
-                        count_frames[gidx] += 1
+                            neighbor_ids = [i for i in range(
+                                max(0, f - NEIGHBOR_STRIDE),
+                                min(stride_length, f + NEIGHBOR_STRIDE + 1))]
+                            ref_ids = [i for i in range(0, stride_length, REF_STEP)
+                                       if i not in neighbor_ids]
 
-            # Compute PSNR on corrupted frames only
-            vid_psnrs = []
-            for i, frame in enumerate(sum_frames):
-                if frame is None:
-                    continue
-                comp = (frame / count_frames[i]).astype(np.uint8)
+                        sel_imgs  = imgs[:1, neighbor_ids + ref_ids]
+                        sel_masks = masks[:1, neighbor_ids + ref_ids]
 
-                mask_path = os.path.join(mpath, f'{i:05d}.png')
-                if os.path.exists(mask_path):
-                    mask_raw = cv2.imread(mask_path, cv2.IMREAD_GRAYSCALE)
+                        with autocast(enabled=val_use_amp, dtype=torch.float16):
+                            pred_out, _ = netG(sel_imgs, sel_imgs, sel_masks, len(neighbor_ids))
+                            pred_out = pred_out[:, :, :h, :w]
+                            pred_out = (pred_out + 1) / 2
+                            pred_np  = pred_out.float().cpu().permute(0, 2, 3, 1).numpy() * 255
+
+                        for i, idx in enumerate(neighbor_ids):
+                            gidx   = itern * FRAMESTRIDE + idx
+                            mask2d = bmasks[idx][:, :, 0:1].astype(np.float32)
+                            img    = (pred_np[i].astype(np.float32) * mask2d +
+                                      raw_f[idx].astype(np.float32) * (1.0 - mask2d)).astype(np.uint8)
+                            if sum_frames[gidx] is None:
+                                sum_frames[gidx] = img.astype(np.float32)
+                            else:
+                                sum_frames[gidx] += img.astype(np.float32)
+                            count_frames[gidx] += 1
+
+                        del sel_imgs, sel_masks, pred_out
+
+                    del imgs, masks
+                    if getattr(device, "type", str(device)) == 'cuda':
+                        torch.cuda.empty_cache()
+
+                # Compute masked PSNR on corrupted frames only (PSNR-aligned with training)
+                vid_psnrs = []
+                vid_ssims = []
+                for i, frame in enumerate(sum_frames):
+                    if frame is None:
+                        continue
+                    comp = (frame / count_frames[i]).astype(np.uint8)
+
+                    mask_path = os.path.join(mpath, f'{i:05d}.png')
+                    mask_raw = None
+                    if os.path.exists(mask_path):
+                        mask_raw = cv2.imread(mask_path, cv2.IMREAD_GRAYSCALE)
                     if mask_raw is None or not np.any(mask_raw > 0):
                         continue
 
@@ -533,12 +594,27 @@ class Trainer:
                                           interpolation=cv2.INTER_CUBIC)
                 pred_f = cv2.cvtColor(pred_bgr, cv2.COLOR_BGR2RGB).astype(np.float64)
                 gt_f   = cv2.cvtColor(gt_bgr,   cv2.COLOR_BGR2RGB).astype(np.float64)
-                mse    = np.mean((pred_f - gt_f) ** 2)
+
+                # mask -> GT resolution, apply same dilation used elsewhere
+                m = (mask_raw > 0).astype(np.uint8)
+                if m.shape[:2] != gt_bgr.shape[:2]:
+                    m = cv2.resize(m,
+                                   (gt_bgr.shape[1], gt_bgr.shape[0]),
+                                   interpolation=cv2.INTER_NEAREST)
+                mse  = float(np.mean((pred_f - gt_f) ** 2))
                 psnr   = 20.0 * np.log10(255.0 / np.sqrt(mse)) if mse > 0 else float('inf')
                 vid_psnrs.append(psnr)
 
-            if vid_psnrs:
-                all_psnrs.append(float(np.mean(vid_psnrs)))
+                # SSIM is computed on the full RGB frame (still only on corrupted frames)
+                try:
+                    vid_ssims.append(float(ssim_func(pred_f, gt_f, data_range=255.0, channel_axis=2)))
+                except Exception:
+                    pass
+
+                if vid_psnrs:
+                    all_psnrs.append(float(np.mean(vid_psnrs)))
+                if vid_ssims:
+                    all_ssims.append(float(np.mean(vid_ssims)))
 
         self._restore_from_backup(netG, ema_backup)
         netG.train()
@@ -547,10 +623,21 @@ class Trainer:
             return
 
         mean_psnr = float(np.mean(all_psnrs))
+        mean_ssim = float(np.mean(all_ssims)) if all_ssims else 0.0
 
-        # CSV log
+        # CSV log (backward compatible with older 2-col files)
+        want_ssim = True
+        if os.path.isfile(self.val_csv_path):
+            try:
+                header = open(self.val_csv_path, 'r').readline().strip().lower()
+                want_ssim = ('ssim' in header)
+            except Exception:
+                want_ssim = False
         with open(self.val_csv_path, 'a') as f:
-            f.write(f'{it},{mean_psnr:.4f}\n')
+            if want_ssim:
+                f.write(f'{it},{mean_psnr:.4f},{mean_ssim:.6f}\n')
+            else:
+                f.write(f'{it},{mean_psnr:.4f}\n')
 
         # Tensorboard
         if self.gen_writer is not None:
@@ -570,7 +657,7 @@ class Trainer:
 
         marker = '  ← NEW BEST' if is_best else ''
         print(f'\n[Val @ {it}] mean PSNR: {mean_psnr:.4f} dB  '
-              f'(best: {self.best_psnr:.4f} dB){marker}')
+              f'mean SSIM: {mean_ssim:.4f}  (best: {self.best_psnr:.4f} dB){marker}')
 
     def train(self):
         """training entry"""
@@ -637,9 +724,10 @@ class Trainer:
             l_t = self.num_local_frames
             b, t, c, h, w = frames.size()
             
-            pred_imgs, _ = self.netG(frames, corrupts, masks, l_t)
-            pred_imgs = pred_imgs.view(b, -1, c, h, w)
-            comp_imgs = corrupts * (1. - masks) + masks * pred_imgs
+            with autocast(enabled=self.use_amp, dtype=torch.float16):
+                pred_imgs, _ = self.netG(frames, corrupts, masks, l_t)
+                pred_imgs = pred_imgs.view(b, -1, c, h, w)
+                comp_imgs = corrupts * (1. - masks) + masks * pred_imgs
 
             # ── Temporal difference loss ──────────────────────────────────────
             # w_td ramp: 0 for iter<500, linear 0→td_max for iter 500-2000, td_max after
@@ -667,7 +755,7 @@ class Trainer:
                 w_mask     = w_flat.reshape(b, l_t - 1, 1, h, w)
 
                 td_err     = (d_comp - d_gt).abs() * w_mask
-                td_loss    = td_err.mean() / (w_mask.mean() + 1e-6)
+                td_loss    = td_err.float().mean() / (w_mask.float().mean() + 1e-6)
                 td_loss_item = td_loss.item()
             else:
                 td_loss      = torch.tensor(0.0).to(device)
@@ -687,58 +775,55 @@ class Trainer:
                     pass
                 else:
                     # discriminator adversarial loss
-                    real_clip = self.netD(frames)
-                    fake_clip = self.netD(comp_imgs.detach())
+                    with autocast(enabled=self.use_amp, dtype=torch.float16):
+                        real_clip = self.netD(frames)
+                        fake_clip = self.netD(comp_imgs.detach())
                     dis_real_loss = self.adversarial_loss(real_clip, True, True)
                     dis_fake_loss = self.adversarial_loss(fake_clip, False, True)
                     dis_loss += (dis_real_loss + dis_fake_loss) / 2       
                     
                     self.optimD.zero_grad()
-                    dis_loss.backward()
-                    self.optimD.step()
+                    if self.use_amp:
+                        self.scaler.scale(dis_loss).backward()
+                        self.scaler.step(self.optimD)
+                    else:
+                        dis_loss.backward()
+                        self.optimD.step()
 
                     # generator adversarial loss
-                    gen_clip = self.netD(comp_imgs)
+                    with autocast(enabled=self.use_amp, dtype=torch.float16):
+                        gen_clip = self.netD(comp_imgs)
                     gan_loss = self.adversarial_loss(gen_clip, True, False)
                     gan_loss = gan_loss \
                         * self.config['losses']['adversarial_weight']
                     gen_loss += gan_loss
 
-            # generator l1 hole loss
-            hole_loss_0 = self.l1_loss(pred_imgs * masks, frames * masks)
-            hole_loss = hole_loss_0 / torch.mean(masks) \
-                * self.config['losses']['hole_weight']
-            gen_loss += hole_loss
+            # masked MSE reconstruction losses (PSNR-aligned)
+            eps        = 1e-6
+            diff       = (pred_imgs - frames).float()
+            sq         = diff ** 2
+            masks_f    = masks.float()
 
-            valid_loss_0 = self.l1_loss(pred_imgs * (1 - masks),
-                                    frames * (1 - masks))
-            valid_loss = valid_loss_0 / torch.mean(1-masks) \
-                * self.config['losses']['valid_weight']
+            hole_loss  = (sq * masks_f).mean()       / (masks_f.mean()        + eps) \
+                         * self.config['losses']['hole_weight']
+            valid_loss = (sq * (1 - masks_f)).mean() / ((1-masks_f).mean()    + eps) \
+                         * self.config['losses']['valid_weight']
+            w_l1       = float(self.config['losses'].get('l1_weight', 0.1))
+            l1_stab    = torch.mean(torch.abs(diff))   # L1 stabilizer (weighted separately)
+
+            gen_loss += hole_loss
             gen_loss += valid_loss
+            gen_loss += w_l1 * l1_stab
             gen_loss += w_td * td_loss
 
-            # EMA-consistency regularizer: L1(pred - pred_ema) inside local masks.
-            cons_ema_loss = torch.tensor(0.0, device=device)
-            if (self.use_ema and self.ema_state and self.cons_weight > 0.0
-                    and self.cons_every > 0 and self.iteration % self.cons_every == 0):
-                netG_ref = self.netG.module if isinstance(self.netG, (nn.DataParallel, DDP)) else self.netG
-                ema_backup = self._swap_in_ema(netG_ref)
-                with torch.no_grad():
-                    pred_ema, _ = netG_ref(frames, corrupts, masks, l_t)
-                    pred_ema = pred_ema.view(b, -1, c, h, w)[:, :l_t]
-                self._restore_from_backup(netG_ref, ema_backup)
-
-                pred_loc = pred_imgs[:, :l_t]
-                pred_ema_loc = pred_ema
-                mask_loc = masks[:, :l_t]
-                cons_l1 = (pred_loc - pred_ema_loc).abs() * mask_loc
-                cons_l1 = cons_l1.mean() / (mask_loc.mean() + 1e-6)
-                cons_ema_loss = self.cons_weight * cons_l1
-                gen_loss += cons_ema_loss
-
             self.optimG.zero_grad()
-            gen_loss.backward()
-            self.optimG.step()
+            if self.use_amp:
+                self.scaler.scale(gen_loss).backward()
+                self.scaler.step(self.optimG)
+                self.scaler.update()
+            else:
+                gen_loss.backward()
+                self.optimG.step()
             self._update_ema()
             
             if not self.config['model']['no_dis']:
@@ -752,11 +837,15 @@ class Trainer:
                              hole_loss.item())
             self.add_summary(self.gen_writer, 'loss/valid_loss',
                              valid_loss.item())
+            self.add_summary(self.gen_writer, 'loss/l1_stab',
+                             (w_l1 * l1_stab).item())
             self.add_summary(self.gen_writer, 'loss/td_loss', td_loss_item)
-            self.add_summary(self.gen_writer, 'loss/cons_ema',
-                             cons_ema_loss.item())
             self.add_summary(self.gen_writer, 'stat/mask_ratio', mask_ratio)
             self.add_summary(self.gen_writer, 'stat/w_td', w_td)
+            self.add_summary(self.gen_writer, 'stat/w_l1', w_l1)
+            if not self.config['model']['no_dis']:
+                self.add_summary(self.gen_writer, 'stat/w_gan',
+                                 float(self.config['losses'].get('adversarial_weight', 0.0)))
             
             self.update_learning_rate()      
             self.iteration += 1
@@ -779,22 +868,41 @@ class Trainer:
                                          ))
 
                 if self.iteration % self.train_args['log_freq'] == 0:
+                    # CSV log (every log_freq; avoids per-iter I/O)
+                    gan_item = gan_loss.item() if (not self.config['model']['no_dis']) else 0.0
+                    dis_item = dis_loss.item() if (not self.config['model']['no_dis']) else 0.0
+                    lr_item  = self.get_lr()
+                    w_gan    = float(self.config['losses'].get('adversarial_weight', 0.0))
+                    with open(self.train_csv_path, 'a', newline='') as f:
+                        w = csv.writer(f)
+                        w.writerow([
+                            int(self.iteration), float(lr_item),
+                            float(hole_loss.item()), float(valid_loss.item()),
+                            float((w_l1 * l1_stab).item()), float(td_loss_item), float(gan_item),
+                            float(gen_loss.item()), float(dis_item),
+                            float(mask_ratio), float(w_td), float(w_l1), float(w_gan),
+                        ])
                     if not self.config['model']['no_dis']:
                         logging.info(f"[Iter {self.iteration}] "
                                      f"d: {dis_loss.item():.4f}; "
                                      f"hole: {hole_loss.item():.4f}; "
                                      f"valid: {valid_loss.item():.4f}; "
+                                     f"l1: {(w_l1 * l1_stab).item():.4f}; "
                                      f"td: {td_loss_item:.4f}; "
                                      f"mask_ratio: {mask_ratio:.3f}; "
-                                     f"w_td: {w_td:.4f}"
+                                     f"w_td: {w_td:.4f}; "
+                                     f"w_l1: {w_l1:.3f}; "
+                                     f"w_gan: {float(self.config['losses'].get('adversarial_weight', 0.0)):.3f}"
                                         )
                     else:
                         logging.info(f"[Iter {self.iteration}] "
                                      f"hole: {hole_loss.item():.4f}; "
                                      f"valid: {valid_loss.item():.4f}; "
+                                     f"l1: {(w_l1 * l1_stab).item():.4f}; "
                                      f"td: {td_loss_item:.4f}; "
                                      f"mask_ratio: {mask_ratio:.3f}; "
-                                     f"w_td: {w_td:.4f}"
+                                     f"w_td: {w_td:.4f}; "
+                                     f"w_l1: {w_l1:.3f}"
                                      )
 
             # saving models + inline val eval

@@ -1,49 +1,69 @@
 {
-  "save_dir": "checkpoints/ema_cons_run1",
+  "save_dir": "checkpoints/psnr_run5",
+
   "model": {
     "net": "b2scvr_hq",
     "no_dis": true,
-    "pretrain": "checkpoints/main_best.pth"
+    "pretrain": "checkpoints/ema_cons_run1/gen_best.pth"
   },
+
   "trainer": {
-    "iterations": 25000,
+    "iterations": 30000,
     "batch_size": 1,
     "num_workers": 4,
+
     "lr": 2e-6,
     "beta1": 0.9,
     "beta2": 0.999,
     "weight_decay": 1e-4,
+
     "spynet_lr": 1.0,
+
     "save_freq": 1000,
     "log_freq": 50,
+
+    "use_amp": true,
+
     "use_ema": true,
     "ema_decay": 0.999,
-    "keep_last_k": 6,
+
+    "keep_last_k": 5,
+
     "scheduler": {
       "type": "MultiStepRestartLR",
-      "milestones": [4000, 8000],
+      "milestones": [8000, 16000],
       "gamma": 0.5
     }
   },
+
   "losses": {
-    "GAN_LOSS": "hinge",
+    "GAN_LOSS": "lsgan",
     "adversarial_weight": 0.0,
-    "hole_weight": 1.0,
-    "valid_weight": 1.0,
+
+    "hole_weight": 1.5,
+    "valid_weight": 0.5,
+    "l1_weight": 0.1,
     "td_weight": 0.0
   },
+
   "val_data": {
     "video_dir": "worst10/bsc_imgs",
     "mask_dir": "worst10/masks",
-    "gt_dir": "worst10/gt_imgs"
+    "gt_dir": "worst10/gt_imgs",
+    "use_train_frame_counts": false,
+    "use_amp": false
   },
+
   "train_data_loader": {
     "format": "dir",
+
     "gt_root": "/home/ajeet/MINIP/data/train/train_gt_imgs",
     "bsc_root": "/home/ajeet/MINIP/data/train/train_bsc_imgs",
     "mask_root": "/home/ajeet/MINIP/data/train/train_masks",
+
     "num_local_frames": 5,
     "num_ref_frames": 3,
+
     "w": 432,
     "h": 240
   }
