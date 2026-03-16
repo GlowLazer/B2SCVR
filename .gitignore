@@ -1,11 +1,20 @@
-__pycache__
-__pycache__/*
-*/__pycache__/*/*
-Vroom
-outputs
-Vroom.zip
-checkpoints/B2SCVR_ckpts
+# Python cache
+__pycache__/
+**/__pycache__/
+core/__pycache__/
+
+# Checkpoints and temporary files
 checkpoints/
 temp_alpha/
-worst10
-core/__pycache__/*
+worst10/
+
+# Output folders and logs
+output*/
+log*/
+check_submit/
+
+# Project-specific files
+Vroom
+Vroom_fused
+*.pth
+*.zip

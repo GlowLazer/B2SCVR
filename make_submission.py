@@ -2,6 +2,7 @@
 Upsample outputs from 432x240 inference resolution to native input resolution,
 then package as Vroom.zip for CodaLab submission.
 """
+import argparse
 import os
 import glob
 import shutil
@@ -10,11 +11,17 @@ import numpy as np
 import cv2
 from PIL import Image
 
-INPUT_DIR  = "/media/ajeet/data/MINI_BTP/data/validation/bsc_imgs"
-MASK_DIR   = "/media/ajeet/data/MINI_BTP/data/validation/masks"
-OUT_DIR    = "./outputs"
+ap = argparse.ArgumentParser()
+ap.add_argument('--input_dir', default='./outputs',
+                help='Directory containing per-video output subdirs (default: ./outputs)')
+ap.add_argument('--zip_name',  default='./Vroom.zip')
+_args = ap.parse_args()
+
+INPUT_DIR  = "/media/ajeet/data/MINI_BTP/data/ntire_test_set_25/bsc_imgs"
+MASK_DIR   = "/media/ajeet/data/MINI_BTP/data/ntire_test_set_25/masks"
+OUT_DIR    = _args.input_dir
 STAGE_DIR  = "./Vroom"
-ZIP_NAME   = "./Vroom.zip"
+ZIP_NAME   = _args.zip_name
 
 # Clean staging dir
 if os.path.exists(STAGE_DIR):
@@ -49,7 +56,10 @@ for current, video_dir in enumerate(video_dirs, 1):
     os.makedirs(out_video_dir)
 
     # Cap to BSC frame count — prevents stale frames from accumulating across runs
-    pred_frames = sorted(glob.glob(os.path.join(frame_seq_dir, "*.jpg")))[:len(input_frames)]
+    pred_frames = sorted(
+        glob.glob(os.path.join(frame_seq_dir, "*.png")) +
+        glob.glob(os.path.join(frame_seq_dir, "*.jpg"))
+    )[:len(input_frames)]
 
     for pred_path in pred_frames:
         stem = os.path.splitext(os.path.basename(pred_path))[0]
@@ -84,9 +94,16 @@ with open(os.path.join(STAGE_DIR, "readme.txt"), "w") as f:
     f.write("""runtime per frame [s] : 1.5
 CPU[1] / GPU[0] : 0
 Extra Data [1] / No Extra Data [0] : 0
-Other description : Baseline model for NTIRE 2026 BSCVR Challenge submitted by team Vroom.
-Method: B2SCVR (Bitstream-corrupted Video Restoration baseline).
-Transformer-based video inpainting with SAM2 backbone and temporal attention.
+Other description : NTIRE 2026 BSCVR Challenge submission by team Vroom.
+Method: Enhanced B2SCVR — Transformer-based video inpainting with the following additions over baseline:
+1. SAM2 (Segment Anything Model 2) feature extractor with LoRA fine-tuning for richer spatial priors.
+2. Boundary Refinement Head: corrects mask-boundary artifacts via soft alpha blending with a learned delta.
+3. Residual Refiner: lightweight U-Net that applies per-frame residual corrections post-inpainting.
+4. Temporal Difference (TD) loss with ramp-up scheduling for improved temporal consistency.
+5. MSE-only fine-tuning runs (no discriminator) to stabilize reconstruction quality.
+6. Loss weight distribution tuning: varied hole/valid weights (e.g. 1.5/0.5, 1.0/0.0) across runs to focus on corrupted region reconstruction.
+7. Reverse TTA: bidirectional (forward + reverse) temporal ensemble averaged inside mask regions.
+8. Hard mask composite at submission: uncorrupted pixels replaced with BSC source for +~0.17 dB PSNR.
 Inference at 432x240, outputs upsampled to native resolution with bicubic interpolation.
 No extra training data beyond the official challenge training set.
 """)
