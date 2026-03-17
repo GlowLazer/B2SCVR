@@ -18,7 +18,7 @@ ap.add_argument('--bsc_dir', required=True,
                 help='Path to BSC input frames root (e.g. /data/ntire_test/bsc_imgs)')
 ap.add_argument('--mask_dir', required=True,
                 help='Path to masks root (e.g. /data/ntire_test/masks)')
-ap.add_argument('--zip_name',  default='./Vroom.zip')
+ap.add_argument('--zip_name',  default='./Vroom.lala.zip')
 _args = ap.parse_args()
 
 INPUT_DIR  = _args.bsc_dir

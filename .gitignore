@@ -4,7 +4,7 @@ __pycache__/
 core/__pycache__/
 
 # Checkpoints and temporary files
-checkpoints/
+checkpoints*/
 temp_alpha/
 worst10/
 
@@ -14,7 +14,6 @@ log*/
 check_submit/
 
 # Project-specific files
-Vroom
-Vroom_fused
+Vroom*/
 *.pth
 *.zip
