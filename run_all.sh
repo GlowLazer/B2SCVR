@@ -10,9 +10,9 @@ bash vali.sh
 
 echo ""
 echo "========================================="
-echo " Step 2/3: Building submission ZIP"
+echo " Step 2/3: Post-processing outputs (run_model.py)"
 echo "========================================="
-python make_submission.py
+python run_model.py
 
 echo ""
 echo "========================================="
@@ -24,3 +24,4 @@ echo ""
 echo "========================================="
 echo " Done."
 echo "========================================="
+
