@@ -1,0 +1,16 @@
+services:
+  b2scvr:
+    build: .
+    image: b2scvr:cu121
+    working_dir: /workspace
+    volumes:
+      - .:/workspace
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - driver: nvidia
+              count: all
+              capabilities: [gpu]
+    command: bash
+

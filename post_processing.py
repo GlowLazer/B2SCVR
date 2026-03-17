@@ -27,10 +27,12 @@ OUT_DIR    = _args.input_dir
 STAGE_DIR  = "./Vroom"
 ZIP_NAME   = _args.zip_name
 
-# Clean staging dir
+# Clean staging dir (clear contents; rmtree on the dir itself fails when it is a bind mount)
 if os.path.exists(STAGE_DIR):
-    shutil.rmtree(STAGE_DIR)
-os.makedirs(STAGE_DIR)
+    for _entry in os.scandir(STAGE_DIR):
+        shutil.rmtree(_entry.path) if _entry.is_dir() else os.remove(_entry.path)
+else:
+    os.makedirs(STAGE_DIR)
 
 video_dirs = sorted(glob.glob(os.path.join(OUT_DIR, "*")))
 video_dirs = [d for d in video_dirs if os.path.isdir(d)]

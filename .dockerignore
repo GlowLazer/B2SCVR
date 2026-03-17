@@ -1,0 +1,22 @@
+.git
+.gitignore
+__pycache__/
+**/__pycache__/
+*.pyc
+*.pyo
+*.pyd
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+
+# Large artifacts (mount at runtime instead)
+checkpoints/
+checkpoints_old/
+outputs/
+logs/
+Vroom/
+Vroom.zip
+Vroom.lala.zip
+Vroom_old_submitted/
+worst10/
+
