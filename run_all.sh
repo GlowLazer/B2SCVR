@@ -1,8 +1,6 @@
 #!/bin/bash
 set -e
 
-cd /media/ajeet/data/MINI_BTP/B2SCVR
-
 echo "========================================="
 echo " Step 1/3: Running inference (vali.sh)"
 echo "========================================="

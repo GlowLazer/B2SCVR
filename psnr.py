@@ -8,8 +8,8 @@ from skimage.metrics import structural_similarity as ssim_func
 p = argparse.ArgumentParser()
 p.add_argument('--input_dir', default='./Vroom',
                help='Directory of per-video subdirs to evaluate (default: ./Vroom)')
-p.add_argument('--gt_dir',   default='/media/ajeet/data/MINI_BTP/data/validation/gt_imgs')
-p.add_argument('--mask_dir', default='/media/ajeet/data/MINI_BTP/data/validation/masks')
+p.add_argument('--gt_dir',   default='data/validation/gt_imgs')
+p.add_argument('--mask_dir', default='data/validation/masks')
 args = p.parse_args()
 
 GT_DIR   = args.gt_dir

@@ -6,7 +6,7 @@ from model.modules.lora_utils import LoRALinear, inject_lora_sam2 as inject_lora
 
 
 class SAM2Extractor(nn.Module):
-    def __init__(self, checkpoint_path="/media/ajeet/data/MINI_BTP/B2SCVR/checkpoints/B2SCVR_ckpts/checkpoint.pt") -> None:
+    def __init__(self, checkpoint_path="checkpoints/B2SCVR_ckpts/checkpoint.pt") -> None:
         super(SAM2Extractor, self).__init__()
         model_cfg = "configs/sam2.1/sam2.1_hiera_t.yaml"
         if checkpoint_path:

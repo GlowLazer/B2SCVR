@@ -4,12 +4,14 @@ This repository contains Team Vroom's submission for the
 NTIRE 2026 Challenge on Bitstream-corrupted Video Restoration (BSCVR).
 
 Built upon the [B2SCVR baseline](https://github.com/LIUTIGHE/B2SCVR) with the
-following enhancements:
-- SAM2 Hiera-T feature extractor with LoRA fine-tuning
-- Boundary Refinement Head for mask-boundary artefact correction
-- Residual Refiner (lightweight U-Net, ~768K params) for per-frame correction
-- Reverse TTA (bidirectional temporal ensemble with learned Spatial Alpha Net)
-- MSE-only fine-tuning with tuned hole/valid loss weights
+following enhancements (in development order):
+1. Reverse TTA — bidirectional temporal ensemble 
+2. Temporal Difference Loss — enforces frame-to-frame consistency during training
+3. Boundary Refinement Head — corrects mask-boundary artefacts via soft alpha blending
+4. Residual Refiner — lightweight U-Net (~768K params) for per-frame residual correction
+5. LoRA fine-tuning — low-rank adaptation of SAM2 Hiera trunk and Transformer attention blocks
+6. Loss function modification — fine-tuned from baseline 
+7. Weighted loss combination — `λ₁·L_hole + λ₂·L_valid + λ₃·L_l1_stab` tuning → final submitted model
 
 ---
 
@@ -18,7 +20,7 @@ following enhancements:
 **Requirements:** Python 3.10, CUDA 12.1
 
 ```bash
-git clone <this-repo>
+git clone https://github.com/GlowLazer/B2SCVR
 cd B2SCVR
 
 # 1. Create conda environment
@@ -98,45 +100,9 @@ python make_submission.py \
 This upsamples outputs to native resolution, applies a hard-mask composite
 (+~0.17 dB PSNR), and packages everything as `Vroom.zip` for CodaBench submission.
 
----
-
-## Training
-
-To reproduce the submitted checkpoint (`psnr_run5`):
-
-```bash
-# 1. Train base model
-python train.py --c config/ema_cons_run1.json
-
-# 2. Fine-tune with PSNR-optimized loss weights
-python train.py --c config/config_psnr.json
-
-# 3. Train LoRA adapters
-python train_lora_sam2.py --c config/lora_sam2.json
-python train_lora_transformer.py
-
-# 4. Train Residual Refiner
-bash gen_train_preds_1500.sh   # generate training predictions
-python train_refiner.py
-
-# 5. Train Boundary Head
-python train_boundary.py
-```
-
----
-
-## Results (Validation — worst10 set, 432x240)
-
-| Configuration | PSNR (dB) | SSIM |
-|---|---|---|
-| Baseline (`main_best.pth`) | 18.24 | — |
-| + MSE weight tuning (`psnr_run5`) | 20.23 | 0.747 |
-| + Residual Refiner (full pipeline) | 22.73 | 0.791 |
-
----
-
 ## Acknowledgements
 
-Built upon [B2SCVR](https://github.com/LIUTIGHE/B2SCVR),
+Built upon
+[B2SCVR](https://github.com/LIUTIGHE/B2SCVR),
 [SAM2](https://github.com/facebookresearch/sam2), and
 [ATD](https://github.com/LabShuHangGU/Adaptive-Token-Dictionary).
