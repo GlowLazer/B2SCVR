@@ -2,7 +2,7 @@
 # Run full inference pipeline on NTIRE 2026 BSCVR test set.
 #
 # Usage:
-#   bash vali.sh --video_dir /path/to/bsc_imgs --mask_dir /path/to/masks
+#   bash vali.sh --bsc_dir /path/to/bsc_imgs --mask_dir /path/to/masks
 #
 # Optional:
 #   --out_dir  ./outputs   (default)

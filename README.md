@@ -17,7 +17,9 @@ following enhancements (in development order):
 
 ## Installation
 
-**Requirements:** Python 3.10, CUDA 12.1
+**Requirements:** Python 3.10, CUDA 12.1.
+
+*The Codebase assumes a Linux based system. Please run it on Linux or WSL on Windows.*
 
 ```bash
 git clone https://github.com/GlowLazer/B2SCVR
@@ -58,22 +60,48 @@ pip install -r requirements.txt
 
 Place the following checkpoints in the `checkpoints/` directory:
 
+`run_all.sh` / `vali.sh` / `test.py` expect the following layout:
+
 | File | Description |
 |------|-------------|
-| `checkpoints/psnr_run5/gen_best.pth` | Main inpainting model (submitted) |
+| `checkpoints/ckpt_best/gen_best.pth` | Main inpainting model |
 | `checkpoints/boundary_head_best.pth` | Boundary Refinement Head |
-| `checkpoints/refiner_1500_best.pth` | Residual Refiner |
-| `checkpoints/lora_sam2_run3_best.pth` | SAM2 LoRA + SAMFuser weights |
-| `checkpoints/lora_transformer_on_sam2_best.pth` | Transformer LoRA weights |
+| `checkpoints/refiner_best.pth` | Residual Refiner |
+| `checkpoints/lora_sam_best.pth` | SAM2 LoRA + SAMFuser weights |
+| `checkpoints/lora_transformer_on_sam_best.pth` | Transformer LoRA weights |
 | `checkpoints/B2SCVR_ckpts/checkpoint.pt` | SAM2.1 Hiera-T backbone |
 
 ---
 
-## Inference
+## Quickstart (main pipeline)
+
+The main pipeline is `run_all.sh` (inference → post-processing → PSNR/SSIM):
+
+```bash
+bash run_all.sh \
+  --bsc_dir  /path/to/bsc_imgs \
+  --mask_dir /path/to/masks \
+  --gt_dir   /path/to/gt_imgs
+```
+
+What it does:
+1. Runs inference (`vali.sh` → `test.py`) and writes raw outputs to `./outputs/<video>/frame_seq/*.png`
+2. Upsamples + hard-mask composites and writes evaluation/submission-ready frames to `./Vroom/<video>/*.png`
+3. Evaluates PSNR/SSIM with `psnr.py` (default input dir is `./Vroom`)
+
+### Expected data layout
+
+- `--bsc_dir`: `/path/to/bsc_imgs/<video_name>/*.jpg`
+- `--mask_dir`: `/path/to/masks/<video_name>/*.png`
+- `--gt_dir`: `/path/to/gt_imgs/<video_name>/*.(jpg|png)`
+
+---
+
+## Inference only (no GT needed)
 
 ```bash
 bash vali.sh \
-  --video_dir /path/to/bsc_imgs \
+  --bsc_dir  /path/to/bsc_imgs \
   --mask_dir  /path/to/masks
 ```
 
