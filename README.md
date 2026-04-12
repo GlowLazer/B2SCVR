@@ -1,7 +1,13 @@
 # Enhanced B2SCVR — NTIRE 2026 BSCVR Challenge (Team Vroom)
 
-This repository contains Team Vroom's submission for the
-NTIRE 2026 Challenge on Bitstream-corrupted Video Restoration (BSCVR).
+<p align="center">
+  <a href="https://arxiv.org/abs/2604.06945">
+    <img src="https://img.shields.io/badge/arXiv-Paper-B31B1B?logo=arxiv&logoColor=white" alt="arXiv Paper" />
+  </a>
+</p>
+
+This repository contains Team Vroom's **4th-place submission** for the
+**NTIRE 2026 Challenge on Bitstream-Corrupted Video Restoration (BSCVR)**.
 
 Built upon the [B2SCVR baseline](https://github.com/LIUTIGHE/B2SCVR) with the
 following enhancements (in development order):
