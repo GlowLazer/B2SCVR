@@ -65,7 +65,7 @@ apt-get install -y --no-install-recommends nvidia-container-toolkit
 
 echo "==> Configuring Docker runtime for NVIDIA"
 nvidia-ctk runtime configure --runtime=docker
-systemctl restart docker
+sudo systemctl restart docker
 
 echo ""
 echo "==> Done."
